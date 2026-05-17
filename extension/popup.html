@@ -1,0 +1,91 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <title>Manhwa → PDF</title>
+  <link rel="stylesheet" href="popup.css" />
+</head>
+<body>
+  <div class="container">
+    <h1>Manhwa → PDF</h1>
+    <p class="subtitle">Auto-download chapter images and save chapter-wise PDFs.</p>
+
+    <form id="downloadForm">
+      <label for="startUrl">Starting chapter URL</label>
+      <input
+        type="url"
+        id="startUrl"
+        name="startUrl"
+        placeholder="https://asurascans.com/comics/.../chapter/1"
+        required
+      />
+      <p class="hint">Open the first chapter you want in your browser and paste its URL here.</p>
+
+      <label for="chapterCount">Number of chapters</label>
+      <input
+        type="number"
+        id="chapterCount"
+        name="chapterCount"
+        min="1"
+        max="500"
+        value="5"
+        required
+      />
+
+      <label for="folderName">Output folder (inside Downloads)</label>
+      <input
+        type="text"
+        id="folderName"
+        name="folderName"
+        placeholder="my-manhwa  or  MyComics/Manhwa"
+        value="manhwa"
+        required
+      />
+      <p class="hint">Nested paths allowed (e.g. <code>Comics/Solo-Leveling</code>).</p>
+
+      <label class="checkbox-row">
+        <input type="checkbox" id="saveAs" />
+        <span>Ask me where to save each chapter (Save As dialog)</span>
+      </label>
+      <p class="hint">Use this if you want to save outside the Downloads folder — Chrome will open a folder picker for each chapter (it remembers the last folder so 2nd+ chapters are 1-click).</p>
+
+      <label for="padDigits">Filename padding</label>
+      <select id="padDigits" name="padDigits">
+        <option value="0" selected>chapter 1, chapter 2, … (no padding)</option>
+        <option value="2">chapter 01, chapter 02, …</option>
+        <option value="3">chapter 001, chapter 002, …</option>
+      </select>
+      <p class="hint">Padding 100+ chapters ke liye useful — file manager me sort sahi rehta hai.</p>
+
+      <label for="quality">JPEG quality</label>
+      <select id="quality" name="quality">
+        <option value="0.95">High (0.95)</option>
+        <option value="0.85" selected>Medium (0.85)</option>
+        <option value="0.75">Low (0.75)</option>
+      </select>
+
+      <div class="row">
+        <button type="submit" id="startBtn">Start</button>
+        <button type="button" id="stopBtn" disabled>Stop</button>
+      </div>
+    </form>
+
+    <div class="progress-section" id="progressSection" hidden>
+      <div class="progress-row">
+        <span id="statusLabel">Idle</span>
+        <span id="statusCount"></span>
+      </div>
+      <div class="progress-bar">
+        <div class="progress-fill" id="progressFill"></div>
+      </div>
+    </div>
+
+    <details class="log-section">
+      <summary>Activity log</summary>
+      <pre id="logBox"></pre>
+    </details>
+  </div>
+
+  <script src="popup.js"></script>
+</body>
+</html>

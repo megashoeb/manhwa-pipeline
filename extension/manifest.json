@@ -1,0 +1,22 @@
+{
+  "manifest_version": 3,
+  "name": "Manhwa Chapter → PDF Downloader",
+  "version": "1.2.0",
+  "description": "Scrape manhwa chapter pages, download all images, and save chapter-wise PDFs to your chosen folder.",
+  "permissions": [
+    "downloads",
+    "storage",
+    "offscreen"
+  ],
+  "host_permissions": [
+    "<all_urls>"
+  ],
+  "background": {
+    "service_worker": "background.js",
+    "type": "module"
+  },
+  "action": {
+    "default_popup": "popup.html",
+    "default_title": "Manhwa → PDF"
+  }
+}
