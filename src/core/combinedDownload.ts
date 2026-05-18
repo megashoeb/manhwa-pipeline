@@ -194,13 +194,8 @@ export async function downloadCombinedRecap(
   let globalIdx = 0;
   for (const entry of entries) {
     for (let i = 0; i < entry.blobs.length; i++) {
-      globalIdx++;
-      const padded = String(globalIdx).padStart(4, "0");
-      const imageName = `${padded}.jpg`;
-      imagesFolder.file(imageName, entry.blobs[i]);
-
       const line = entry.script.lines[i] ?? "";
-      masterLines.push(line);
+      const blob = entry.blobs[i];
 
       // Find the curator score for this curated panel by matching its
       // original PDF page index (recorded in panelSourceIndices). If
@@ -228,21 +223,39 @@ export async function downloadCombinedRecap(
         }
       }
 
-      manifestBeats.push({
-        index: globalIdx,
-        image: `images/${imageName}`,
-        chapter: entry.chapterIndex,
-        source_panel_index: sourceIdx,
-        narration: line,
-        story_weight: storyWeight,
-        visual_impact: visualImpact,
-        curator_reason: curatorReason,
-        alignment_degraded: entry.alignmentDegraded || undefined,
-      });
+      // ---- Pacing splitter ---------------------------------------
+      // If the beat is long (> ~6 sec read time), break it into
+      // sub-beats so no single image hangs around for 15-20 seconds.
+      // First 12 beats use TIGHTER pacing for retention hooks at
+      // video start. Each sub-beat reuses the same panel image (the
+      // CapCut auto-sync will give each its own animation, so even
+      // duplicate visuals get motion variety).
+      const isIntro = globalIdx < PACING_INTRO_BEATS;
+      const subLines = splitLineForPacing(line, isIntro);
 
-      step++;
-      if (step % 10 === 0 || step === totalPanels) {
-        onProgress?.(step, totalSteps, `Packing images/${imageName}`);
+      for (const subLine of subLines) {
+        globalIdx++;
+        const padded = String(globalIdx).padStart(4, "0");
+        const imageName = `${padded}.jpg`;
+        imagesFolder.file(imageName, blob);
+        masterLines.push(subLine);
+
+        manifestBeats.push({
+          index: globalIdx,
+          image: `images/${imageName}`,
+          chapter: entry.chapterIndex,
+          source_panel_index: sourceIdx,
+          narration: subLine,
+          story_weight: storyWeight,
+          visual_impact: visualImpact,
+          curator_reason: curatorReason,
+          alignment_degraded: entry.alignmentDegraded || undefined,
+        });
+
+        step++;
+        if (step % 10 === 0) {
+          onProgress?.(step, totalSteps, `Packing images/${imageName}`);
+        }
       }
     }
   }
@@ -430,6 +443,123 @@ function countWords(line: string): number {
   const tokens = line.trim().split(/\s+/);
   // Drop empty or pure-punctuation tokens (don't pad timing for "—" alone).
   return tokens.filter((t) => /\w/.test(t)).length;
+}
+
+// ---------------------------------------------------------------------
+// Pacing splitter — break long beats into shorter sub-beats so no
+// single image lingers more than ~6 seconds. The first ~12 beats get
+// tighter pacing for retention (faster image changes at video start).
+// ---------------------------------------------------------------------
+
+/** Standard YouTube narrator pace: 150 WPM ≈ 0.4 sec/word. */
+const PACING_SEC_PER_WORD = 60 / 150;
+/** Hard cap per beat — anything longer triggers a split. */
+const PACING_MAX_BEAT_SEC = 6.0;
+/** Aim for this length when grouping sub-beats. */
+const PACING_TARGET_BEAT_SEC = 4.0;
+/** Tighter cap for the intro stretch (first INTRO_BEATS beats). */
+const PACING_INTRO_MAX_BEAT_SEC = 4.0;
+const PACING_INTRO_TARGET_BEAT_SEC = 2.8;
+/** Beats covered by the "intro pacing" rule. ~12 beats × 3 sec = 36 sec
+ *  of fast-cut footage at the start — perfect for retention hooks. */
+const PACING_INTRO_BEATS = 12;
+
+/**
+ * Split a long beat into 1+ sub-beats that each hit the target duration.
+ * Splits prefer sentence boundaries (`.`, `?`, `!`); if a single
+ * sentence is still over the cap it falls back to comma boundaries.
+ *
+ * Returns the original line unchanged when it's already short enough.
+ */
+function splitLineForPacing(line: string, isIntro: boolean): string[] {
+  const maxSec = isIntro ? PACING_INTRO_MAX_BEAT_SEC : PACING_MAX_BEAT_SEC;
+  const targetSec = isIntro
+    ? PACING_INTRO_TARGET_BEAT_SEC
+    : PACING_TARGET_BEAT_SEC;
+  const maxWords = Math.floor(maxSec / PACING_SEC_PER_WORD);
+  const targetWords = Math.max(4, Math.floor(targetSec / PACING_SEC_PER_WORD));
+
+  if (countWords(line) <= maxWords) return [line];
+
+  // Step 1: split into sentences on terminal punctuation.
+  const sentences = line
+    .split(/(?<=[.?!])\s+/)
+    .map((s) => s.trim())
+    .filter((s) => s.length > 0);
+
+  // Step 2: regroup sentences so each chunk hits the target word count
+  // without crossing the max. Single sentences over the max fall through
+  // to the comma-split fallback below.
+  const chunks: string[] = [];
+  let buffer = "";
+  for (const sentence of sentences) {
+    const sw = countWords(sentence);
+    const newBuf = buffer ? `${buffer} ${sentence}` : sentence;
+    const newWords = countWords(newBuf);
+
+    // Single sentence already over the cap — split it on commas now.
+    if (sw > maxWords) {
+      if (buffer) {
+        chunks.push(buffer);
+        buffer = "";
+      }
+      chunks.push(...splitOnCommasForPacing(sentence, maxWords, targetWords));
+      continue;
+    }
+
+    if (newWords <= maxWords) {
+      buffer = newBuf;
+      if (newWords >= targetWords) {
+        chunks.push(buffer);
+        buffer = "";
+      }
+    } else {
+      // Adding this sentence would overflow — flush current buffer first.
+      if (buffer) chunks.push(buffer);
+      buffer = sentence;
+    }
+  }
+  if (buffer) chunks.push(buffer);
+
+  return chunks.length > 0 ? chunks : [line];
+}
+
+/**
+ * Fallback splitter for a single long sentence with no terminal
+ * punctuation breaks. Walks comma boundaries, grouping sub-clauses to
+ * hit the target word count. Final chunk may exceed ``maxWords`` if
+ * the sentence has no commas — that's an acceptable degradation.
+ */
+function splitOnCommasForPacing(
+  sentence: string,
+  maxWords: number,
+  targetWords: number,
+): string[] {
+  const parts = sentence
+    .split(/(?<=,)\s+/)
+    .map((p) => p.trim())
+    .filter((p) => p.length > 0);
+  if (parts.length === 1) return [sentence];
+
+  const chunks: string[] = [];
+  let buffer = "";
+  for (const part of parts) {
+    const newBuf = buffer ? `${buffer} ${part}` : part;
+    const newWords = countWords(newBuf);
+
+    if (newWords <= maxWords) {
+      buffer = newBuf;
+      if (newWords >= targetWords) {
+        chunks.push(buffer);
+        buffer = "";
+      }
+    } else {
+      if (buffer) chunks.push(buffer);
+      buffer = part;
+    }
+  }
+  if (buffer) chunks.push(buffer);
+  return chunks.length > 0 ? chunks : [sentence];
 }
 
 /**
