@@ -224,12 +224,18 @@ export async function downloadCombinedRecap(
       }
 
       // ---- Pacing splitter ---------------------------------------
-      // If the beat is long (> ~6 sec read time), break it into
-      // sub-beats so no single image hangs around for 15-20 seconds.
-      // First 12 beats use TIGHTER pacing for retention hooks at
-      // video start. Each sub-beat reuses the same panel image (the
-      // CapCut auto-sync will give each its own animation, so even
-      // duplicate visuals get motion variety).
+      // Only split BEATS that would otherwise hang an image on screen
+      // longer than the cap (defaults: 8s normal, 5s during the first
+      // few intro beats). Each split sub-beat REUSES the same panel
+      // blob — visual variety comes from the per-clip animation in
+      // CapCut (ANIME mode cycles zoom-in → scroll-down → zoom-out
+      // → scroll-up, so even repeated panels look different in the
+      // final render).
+      //
+      // We DO NOT generate fake scroll windows of the panel — for
+      // typical webtoon panel sizes (~1000×800-1500 px) the cropped
+      // windows look nearly identical in thumbnails, defeating the
+      // purpose. Animations are a better source of motion variety.
       const isIntro = globalIdx < PACING_INTRO_BEATS;
       const subLines = splitLineForPacing(line, isIntro);
 
@@ -453,16 +459,33 @@ function countWords(line: string): number {
 
 /** Standard YouTube narrator pace: 150 WPM ≈ 0.4 sec/word. */
 const PACING_SEC_PER_WORD = 60 / 150;
-/** Hard cap per beat — anything longer triggers a split. */
-const PACING_MAX_BEAT_SEC = 6.0;
-/** Aim for this length when grouping sub-beats. */
-const PACING_TARGET_BEAT_SEC = 4.0;
-/** Tighter cap for the intro stretch (first INTRO_BEATS beats). */
-const PACING_INTRO_MAX_BEAT_SEC = 4.0;
-const PACING_INTRO_TARGET_BEAT_SEC = 2.8;
-/** Beats covered by the "intro pacing" rule. ~12 beats × 3 sec = 36 sec
- *  of fast-cut footage at the start — perfect for retention hooks. */
-const PACING_INTRO_BEATS = 12;
+/**
+ * Hard cap per beat — anything longer triggers a split. 8s is loose
+ * enough that only TRULY long paragraphs (20+ words) get broken up;
+ * normal narrative beats stay 1:1 with their source panel.
+ */
+const PACING_MAX_BEAT_SEC = 8.0;
+/**
+ * Aim for groups this long when flushing chunks. Higher target means
+ * the algorithm packs more sentences together before emitting a chunk
+ * — fewer duplicate images, less aggressive pacing. 7.0s lands just
+ * under the 8s cap so we don't trigger splits unnecessarily.
+ */
+const PACING_TARGET_BEAT_SEC = 7.0;
+/** Tighter cap for the first 3 hook beats only. */
+const PACING_INTRO_MAX_BEAT_SEC = 6.0;
+const PACING_INTRO_TARGET_BEAT_SEC = 5.0;
+/** Only the first 3 beats use intro pacing — the hook stays tight,
+ *  but we don't flood the chapter with duplicates after that. */
+const PACING_INTRO_BEATS = 3;
+/**
+ * Hard cap on how many times a single source panel can be duplicated.
+ * Even a 25-sec beat becomes at most 3 sub-beats (~8.3 sec each) —
+ * limits image repetition so the file listing isn't flooded with 5
+ * copies of the same panel. The CapCut Automation tool will cycle the
+ * ANIME animation across the 2-3 copies for motion variety.
+ */
+const PACING_MAX_SPLITS_PER_BEAT = 3;
 
 /**
  * Split a long beat into 1+ sub-beats that each hit the target duration.
@@ -521,7 +544,40 @@ function splitLineForPacing(line: string, isIntro: boolean): string[] {
   }
   if (buffer) chunks.push(buffer);
 
-  return chunks.length > 0 ? chunks : [line];
+  // Enforce the per-beat duplicate cap. If we overshot (e.g. a
+  // 5-sentence paragraph fired 5 chunks), greedily merge the smallest
+  // adjacent pairs until we're at the cap. The resulting chunks may
+  // exceed the soft target but stay close to it.
+  const capped = capChunkCount(
+    chunks.length > 0 ? chunks : [line],
+    PACING_MAX_SPLITS_PER_BEAT,
+  );
+  return capped;
+}
+
+/**
+ * Merge adjacent chunks until the array length is <= ``maxChunks``.
+ * Picks the pair whose combined word count is smallest each pass —
+ * keeps the final chunk sizes as balanced as possible. Used as the
+ * final safeguard so a single paragraph never spawns more than N
+ * duplicate panels.
+ */
+function capChunkCount(chunks: string[], maxChunks: number): string[] {
+  if (chunks.length <= maxChunks) return chunks;
+  const out = [...chunks];
+  while (out.length > maxChunks) {
+    let bestIdx = 0;
+    let bestCombined = Infinity;
+    for (let i = 0; i < out.length - 1; i++) {
+      const combined = countWords(out[i]) + countWords(out[i + 1]);
+      if (combined < bestCombined) {
+        bestCombined = combined;
+        bestIdx = i;
+      }
+    }
+    out.splice(bestIdx, 2, `${out[bestIdx]} ${out[bestIdx + 1]}`);
+  }
+  return out;
 }
 
 /**
