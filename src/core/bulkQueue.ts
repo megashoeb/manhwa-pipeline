@@ -51,6 +51,14 @@ import {
   formatTiming,
   stopwatch,
 } from "./stageTiming";
+import {
+  deleteSession,
+  fingerprintFile,
+  loadCheckpoints,
+  newSessionId,
+  saveCheckpoint,
+  saveSession,
+} from "./sessionStore";
 
 import type {
   CharacterBible,
@@ -111,6 +119,14 @@ export interface RunBulkQueueOptions {
   onKeyUsed?: (masked: string) => void;
   /** Aborted between chapters (mid-chapter aborts are not supported). */
   abortSignal: AbortSignal;
+  /**
+   * Resume an existing session by ID. When provided, completed
+   * chapters are loaded from IndexedDB and skipped — only the
+   * remaining files in the queue are processed. When omitted, a
+   * fresh session is created and checkpointed after every chapter
+   * for power-cut recovery.
+   */
+  sessionId?: string;
 }
 
 /**
@@ -137,9 +153,31 @@ export async function runBulkQueue(
     onArchiveReady,
     onKeyUsed,
     abortSignal,
+    sessionId: resumedSessionId,
   } = opts;
 
   let masterBible = loadMasterBible();
+
+  // --- Session checkpointing setup ---------------------------------
+  // Either resume an existing session (caller passes ``sessionId``) or
+  // create a fresh one. The session record + per-chapter checkpoints
+  // live in IndexedDB so a power cut mid-run doesn't waste completed
+  // work — on restart we pre-populate ``accumulated[]`` from saved
+  // checkpoints and the chapter loop simply skips them.
+  const sessionId = resumedSessionId ?? newSessionId();
+  await saveSession({
+    id: sessionId,
+    startedAt: Date.now(),
+    pdfFingerprints: files.map(fingerprintFile),
+    options: {
+      longFormRecap,
+      concurrency: concurrencyOverride,
+    },
+    isComplete: false,
+    checkpointCount: 0,
+  }).catch((err) =>
+    console.warn("Session save failed (continuing without checkpoints):", err),
+  );
 
   // SLOT-INDEXED accumulator preserves chapter ORDER regardless of
   // which worker finishes first in parallel mode. ``accumulated[i]``
@@ -160,6 +198,48 @@ export async function runBulkQueue(
   // The next chapter's narrator seeds its first scene with this so
   // narration continues seamlessly instead of restarting cold.
   let lastCompletedTail = "";
+
+  // --- Resume: pre-populate from checkpoints if applicable ---------
+  if (resumedSessionId) {
+    try {
+      const checkpoints = await loadCheckpoints(resumedSessionId);
+      const sortedChapterNums = [...checkpoints.keys()].sort((a, b) => a - b);
+      for (const chapNum of sortedChapterNums) {
+        const entry = checkpoints.get(chapNum)!;
+        const slot = chapNum - 1;
+        if (slot < 0 || slot >= accumulated.length) continue;
+        accumulated[slot] = entry;
+        // Notify UI so the queue row immediately renders as "done"
+        // instead of "waiting" — feels like an instant skip.
+        onItemUpdate(slot, {
+          status: "done",
+          stage: "done",
+          keptCount: entry.blobs.length,
+          lineCount: entry.script.lines.length,
+          finishedAt: Date.now(),
+        });
+      }
+      // Seed lastCompletedHook/Tail from the highest-numbered
+      // checkpoint so the next freshly-processed chapter continues
+      // its narrative smoothly instead of restarting cold.
+      if (sortedChapterNums.length > 0) {
+        const lastNum = sortedChapterNums[sortedChapterNums.length - 1];
+        const lastEntry = checkpoints.get(lastNum)!;
+        if (lastEntry.script.lines.length > 0) {
+          lastCompletedHook = lastEntry.script.lines[0] ?? "";
+          lastCompletedTail = lastEntry.script.lines.slice(-4).join("\n\n");
+        }
+      }
+      console.log(
+        `[RESUME] Loaded ${sortedChapterNums.length} chapter checkpoint(s) from session ${resumedSessionId}`,
+      );
+    } catch (err) {
+      console.warn(
+        "Resume failed — proceeding as fresh run. Reason:",
+        err,
+      );
+    }
+  }
 
   // Pipeline-overlap prefetch cache. When a worker finishes a chapter
   // it speculatively starts extraction of its NEXT likely chapter
@@ -251,6 +331,13 @@ export async function runBulkQueue(
   // Per-chapter processing — same logic as the old sequential loop,
   // now callable from any worker. ``i`` is the file-index slot.
   const processChapter = async (i: number): Promise<void> => {
+    // Skip chapters already loaded from a resumed session's checkpoints.
+    // The UI was notified of their "done" status during the resume
+    // bootstrap; nothing else to do here.
+    if (accumulated[i]) {
+      return;
+    }
+
     const file = files[i];
     // Snapshot at claim time. In sequential mode (default for spec)
     // these are the strict previous chapter's values. In parallel
@@ -521,6 +608,18 @@ export async function runBulkQueue(
               : undefined,
             qualityWarnings: chapterQualityWarnings,
           };
+
+          // Persist this chapter to IndexedDB for power-cut recovery.
+          // Fire-and-forget — we don't await because IDB writes are
+          // <50ms and we don't want to block the worker from claiming
+          // the next chapter. If it fails, this chapter just won't be
+          // resumable; the run itself continues fine.
+          saveCheckpoint(sessionId, i + 1, accumulated[i]!).catch((err) =>
+            console.warn(
+              `Checkpoint save failed for chapter ${i + 1}:`,
+              err,
+            ),
+          );
           onItemUpdate(i, {
             status: "done",
             stage: "done",
@@ -718,6 +817,12 @@ export async function runBulkQueue(
         total: 1,
         message: `Combined ZIP downloaded — ${orderedEntries.length} chapters.`,
       });
+      // Run finished cleanly — wipe checkpoint data. The user can
+      // still re-download via the "Download again" button (cached
+      // Blob in component state), so deleting IDB is safe here.
+      deleteSession(sessionId).catch((err) =>
+        console.warn("Session cleanup failed:", err),
+      );
     } catch (err) {
       // Combined-ZIP failure is loud — the user lost the chance to
       // grab per-chapter ZIPs (they were never created in this mode).

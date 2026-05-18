@@ -25,6 +25,14 @@ import { ApiKeyManager } from "./ApiKeyManager";
 
 import { runBulkQueue, type BulkProgressUpdate } from "../core/bulkQueue";
 import { clearMasterBible, loadMasterBible } from "../core/masterBible";
+import {
+  deleteSession,
+  fingerprintFile,
+  fingerprintsMatch,
+  listActiveSessions,
+  loadCheckpoints,
+  type SessionMeta,
+} from "../core/sessionStore";
 
 import {
   DEFAULT_FILTER_SETTINGS,
@@ -96,6 +104,65 @@ export function BulkMode({ rotator }: Props) {
   const inputRef = useRef<HTMLInputElement>(null);
   const [isDragging, setIsDragging] = useState(false);
 
+  // ---- Resumable sessions ---------------------------------------
+  // IndexedDB-backed checkpoints saved after each chapter. If the
+  // browser closed mid-run (power cut, crash, refresh), we can pick
+  // up exactly where we left off — the user just re-uploads the
+  // same PDFs and clicks Resume. ``activeSessions`` is hydrated on
+  // mount; ``matchingSession`` is the one whose PDF fingerprints
+  // line up with the currently-queued items.
+  const [activeSessions, setActiveSessions] = useState<
+    Array<{ meta: SessionMeta; checkpointCount: number }>
+  >([]);
+
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      try {
+        const sessions = await listActiveSessions();
+        if (cancelled) return;
+        const enriched = await Promise.all(
+          sessions.map(async (meta) => {
+            const cps = await loadCheckpoints(meta.id);
+            return { meta, checkpointCount: cps.size };
+          }),
+        );
+        if (!cancelled) setActiveSessions(enriched);
+      } catch (err) {
+        console.warn("Failed to load resumable sessions:", err);
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  const matchingSession = useMemo(() => {
+    if (items.length === 0 || activeSessions.length === 0) return null;
+    const currentFps = items.map((it) => fingerprintFile(it.file));
+    return (
+      activeSessions.find((s) =>
+        fingerprintsMatch(s.meta.pdfFingerprints, currentFps),
+      ) ?? null
+    );
+  }, [items, activeSessions]);
+
+  const discardSession = useCallback(
+    async (sessionId: string) => {
+      if (
+        !window.confirm(
+          "Discard this saved session? All checkpoint data will be deleted and you'll have to start the run from chapter 1.",
+        )
+      )
+        return;
+      await deleteSession(sessionId).catch(() => {});
+      setActiveSessions((prev) =>
+        prev.filter((s) => s.meta.id !== sessionId),
+      );
+    },
+    [],
+  );
+
   // Re-render whenever the rotator state changes (usage, keys added).
   const [, forceRender] = useState(0);
   useEffect(
@@ -162,7 +229,7 @@ export function BulkMode({ rotator }: Props) {
 
   // ---- run control ----------------------------------------------
 
-  const start = useCallback(async () => {
+  const start = useCallback(async (resumeSessionId?: string) => {
     if (busy || items.length === 0 || !hasAnyKey) return;
     // Reset all non-done items back to pending so a re-run continues
     // through previously-failed ones too.
@@ -207,6 +274,7 @@ export function BulkMode({ rotator }: Props) {
       filterSettings: settings,
       longFormRecap,
       concurrency,
+      sessionId: resumeSessionId,
       onItemUpdate: (queueIdx, patch) => {
         const realIdx = indexMap.get(queueFiles[queueIdx]);
         if (realIdx == null) return;
@@ -262,6 +330,20 @@ export function BulkMode({ rotator }: Props) {
     setProgressByItem(new Map());
     setCrossProgress(null);
     setCurrentKey(null);
+    // Refresh resumable sessions — the just-finished session was
+    // deleted by bulkQueue on successful completion, so this clears
+    // the resume banner from the UI.
+    listActiveSessions()
+      .then(async (sessions) => {
+        const enriched = await Promise.all(
+          sessions.map(async (meta) => {
+            const cps = await loadCheckpoints(meta.id);
+            return { meta, checkpointCount: cps.size };
+          }),
+        );
+        setActiveSessions(enriched);
+      })
+      .catch(() => {});
   }, [busy, items, hasAnyKey, rotator, settings, longFormRecap, parallelChapters]);
 
   function cancel() {
@@ -284,6 +366,18 @@ export function BulkMode({ rotator }: Props) {
 
   return (
     <div className="space-y-8">
+      {/* Resume banner — shows when previously-interrupted session(s)
+          exist in IndexedDB. Once the user uploads matching PDFs, the
+          banner highlights itself + offers a one-click resume. */}
+      {!busy && activeSessions.length > 0 && (
+        <ResumeBanner
+          sessions={activeSessions}
+          matchingSessionId={matchingSession?.meta.id ?? null}
+          onResume={(sessionId) => start(sessionId)}
+          onDiscard={discardSession}
+        />
+      )}
+
       {/* Step 1 — drop PDFs */}
       <Section title="Step 1 — Drop chapter PDFs (multiple)">
         <div
@@ -420,7 +514,7 @@ export function BulkMode({ rotator }: Props) {
             {!busy ? (
               <button
                 type="button"
-                onClick={start}
+                onClick={() => start()}
                 disabled={!hasAnyKey || items.length === 0}
                 className="flex items-center gap-2 rounded bg-emerald-600 px-4 py-2 text-sm font-semibold text-white hover:bg-emerald-500 disabled:cursor-not-allowed disabled:bg-zinc-700 disabled:text-zinc-400"
               >
@@ -500,6 +594,123 @@ export function BulkMode({ rotator }: Props) {
 // =====================================================================
 // Sub-components
 // =====================================================================
+
+/**
+ * Resume banner — appears at the top of BulkMode when one or more
+ * unfinished sessions exist in IndexedDB. The user can:
+ *   • See how many chapters of which run were completed before the
+ *     browser closed (power cut / crash / accidental refresh).
+ *   • Re-upload the same PDFs to enable a one-click Resume button.
+ *   • Discard a session entirely (e.g. they changed their mind and
+ *     don't want to redo this run).
+ *
+ * When the currently-queued PDFs match a saved session's fingerprints,
+ * that session's Resume button is highlighted. Otherwise the user
+ * just sees the saved sessions as references — they can match them
+ * by name or just discard.
+ */
+function ResumeBanner({
+  sessions,
+  matchingSessionId,
+  onResume,
+  onDiscard,
+}: {
+  sessions: Array<{ meta: SessionMeta; checkpointCount: number }>;
+  matchingSessionId: string | null;
+  onResume: (sessionId: string) => void;
+  onDiscard: (sessionId: string) => void;
+}) {
+  return (
+    <div className="rounded-lg border border-amber-700/40 bg-amber-950/30 p-4">
+      <div className="mb-2 flex items-center gap-2 text-amber-300">
+        <CircleDot className="h-4 w-4" />
+        <span className="text-sm font-semibold">
+          {sessions.length === 1
+            ? "Previous session found — resume from where it stopped"
+            : `${sessions.length} previous sessions found — resume any`}
+        </span>
+      </div>
+      <p className="mb-3 text-[12px] leading-relaxed text-amber-200/80">
+        A bulk run was interrupted (power cut / browser closed / tab
+        crashed). Completed chapters are saved to your browser. Re-upload
+        the <span className="font-semibold">same PDFs</span> to enable
+        Resume — already-processed chapters will be skipped automatically.
+      </p>
+      <div className="space-y-2">
+        {sessions.map(({ meta, checkpointCount }) => {
+          const isMatch = meta.id === matchingSessionId;
+          const startedAt = new Date(meta.startedAt);
+          const ageMs = Date.now() - meta.startedAt;
+          const ageLabel =
+            ageMs < 60_000
+              ? "just now"
+              : ageMs < 3_600_000
+                ? `${Math.round(ageMs / 60_000)} min ago`
+                : ageMs < 86_400_000
+                  ? `${Math.round(ageMs / 3_600_000)} h ago`
+                  : `${Math.round(ageMs / 86_400_000)} d ago`;
+          return (
+            <div
+              key={meta.id}
+              className={clsx(
+                "flex items-center justify-between gap-3 rounded border px-3 py-2 text-xs",
+                isMatch
+                  ? "border-emerald-600/60 bg-emerald-950/30"
+                  : "border-zinc-700/50 bg-zinc-900/40",
+              )}
+            >
+              <div className="min-w-0 flex-1">
+                <div
+                  className={clsx(
+                    "font-mono text-[11px] truncate",
+                    isMatch ? "text-emerald-200" : "text-zinc-300",
+                  )}
+                >
+                  {checkpointCount} / {meta.pdfFingerprints.length} chapters
+                  done — started {ageLabel}
+                  {meta.options.longFormRecap ? " · long-form" : ""}
+                </div>
+                <div className="mt-0.5 truncate text-[10px] text-zinc-500">
+                  {meta.pdfFingerprints
+                    .slice(0, 3)
+                    .map((p) => p.name)
+                    .join(", ")}
+                  {meta.pdfFingerprints.length > 3 &&
+                    ` +${meta.pdfFingerprints.length - 3} more`}{" "}
+                  · {startedAt.toLocaleString()}
+                </div>
+              </div>
+              <div className="flex shrink-0 items-center gap-1.5">
+                {isMatch ? (
+                  <button
+                    type="button"
+                    onClick={() => onResume(meta.id)}
+                    className="flex items-center gap-1 rounded bg-emerald-600 px-3 py-1 text-xs font-semibold text-white hover:bg-emerald-500"
+                  >
+                    <Play className="h-3 w-3" />
+                    Resume
+                  </button>
+                ) : (
+                  <span className="rounded bg-zinc-800 px-2 py-1 text-[10px] text-zinc-500">
+                    Upload same PDFs
+                  </span>
+                )}
+                <button
+                  type="button"
+                  onClick={() => onDiscard(meta.id)}
+                  className="flex items-center gap-1 rounded border border-zinc-700 px-2 py-1 text-[10px] text-zinc-400 hover:border-red-500/60 hover:text-red-400"
+                  title="Delete this saved session"
+                >
+                  <Trash2 className="h-3 w-3" />
+                </button>
+              </div>
+            </div>
+          );
+        })}
+      </div>
+    </div>
+  );
+}
 
 function Section({
   title,
