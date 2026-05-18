@@ -8,3 +8,6 @@ Thumbs.db
 *.log
 .vite/
 .vercel/
+
+# Electron packaging output (large installers — don't commit)
+release/
