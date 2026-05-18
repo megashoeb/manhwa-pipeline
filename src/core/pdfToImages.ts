@@ -11,6 +11,7 @@ import * as pdfjsLib from "pdfjs-dist";
 import workerSrc from "pdfjs-dist/build/pdf.worker.mjs?url";
 
 import type { ExtractedPage } from "../types/manhwa";
+import { sliceCanvasIntoPanels, type SliceOptions } from "./panelSlicer";
 
 pdfjsLib.GlobalWorkerOptions.workerSrc = workerSrc;
 
@@ -26,6 +27,13 @@ export interface ExtractOptions {
   quality?: number;
   /** Fires once per finished page; both args are 1-based. */
   onProgress?: (current: number, total: number) => void;
+  /**
+   * Slice tall PDF pages into individual panels (webtoon-format support).
+   * Pass ``false`` to keep the old 1-page = 1-image behaviour. Pass an
+   * object to override slicer thresholds (aspect ratio, gutter height,
+   * etc.). Default = enabled with sensible webtoon defaults.
+   */
+  slicePanels?: boolean | SliceOptions;
 }
 
 /**
@@ -41,11 +49,30 @@ export async function extractPdfPages(
   file: File,
   options: ExtractOptions = {},
 ): Promise<ExtractedPage[]> {
-  const { scale = 2.0, quality = 0.85, onProgress } = options;
+  const {
+    scale = 2.0,
+    quality = 0.85,
+    onProgress,
+    slicePanels = true,
+  } = options;
+
+  // Normalise the slice config — `true` → defaults, object → overrides,
+  // `false` → off (preserves 1-page-per-image behaviour for legacy callers).
+  const sliceOpts: SliceOptions | null =
+    slicePanels === false
+      ? null
+      : slicePanels === true
+        ? {}
+        : slicePanels;
 
   const arrayBuffer = await file.arrayBuffer();
   const pdf = await pdfjsLib.getDocument({ data: arrayBuffer }).promise;
   const pages: ExtractedPage[] = [];
+
+  // Running 1-based index across ALL panels in the document. With slicing
+  // enabled this is bigger than ``pdf.numPages`` for webtoon-format PDFs.
+  // Downstream code (curator, manifest) uses this as the unique panel id.
+  let panelIndex = 0;
 
   try {
     for (let i = 1; i <= pdf.numPages; i++) {
@@ -63,16 +90,58 @@ export async function extractPdfPages(
         viewport,
       }).promise;
 
-      const blob = await canvasToJpegBlob(canvas, quality);
-      const url = URL.createObjectURL(blob);
+      // Decide slice rectangles. With slicing disabled OR a non-webtoon
+      // (square-ish) page, this returns a single full-canvas rect — same
+      // output as the old code path.
+      const slices = sliceOpts
+        ? sliceCanvasIntoPanels(canvas, sliceOpts)
+        : [{ x: 0, y: 0, width: canvas.width, height: canvas.height }];
 
-      pages.push({
-        index: i,
-        width: canvas.width,
-        height: canvas.height,
-        blob,
-        url,
-      });
+      for (const rect of slices) {
+        panelIndex++;
+        // Reuse a single scratch canvas per slice — `drawImage` is cheap;
+        // creating per-slice canvases would balloon memory on tall pages
+        // with 10+ panels.
+        const sliceCanvas =
+          slices.length === 1
+            ? canvas // fast path: whole page = whole slice
+            : (() => {
+                const c = document.createElement("canvas");
+                c.width = rect.width;
+                c.height = rect.height;
+                const sctx = c.getContext("2d");
+                if (!sctx) throw new Error("2D context unavailable for slice");
+                sctx.drawImage(
+                  canvas,
+                  rect.x,
+                  rect.y,
+                  rect.width,
+                  rect.height,
+                  0,
+                  0,
+                  rect.width,
+                  rect.height,
+                );
+                return c;
+              })();
+
+        const blob = await canvasToJpegBlob(sliceCanvas, quality);
+        const url = URL.createObjectURL(blob);
+
+        pages.push({
+          index: panelIndex,
+          width: rect.width,
+          height: rect.height,
+          blob,
+          url,
+        });
+
+        // Release the per-slice scratch canvas (if any).
+        if (sliceCanvas !== canvas) {
+          sliceCanvas.width = 0;
+          sliceCanvas.height = 0;
+        }
+      }
 
       // Free the canvas backing store immediately; some browsers
       // (notably Safari) hold onto it otherwise.
