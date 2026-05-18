@@ -33,6 +33,62 @@ const DB_VERSION = 1;
 const STORE_SESSIONS = "sessions";
 const STORE_CHECKPOINTS = "checkpoints";
 
+// ---------------------------------------------------------------------
+// Desktop disk backup (Level 3 redundancy)
+//
+// In the Electron build the renderer exposes ``window.manhwaApp.diskCheckpoint``
+// via preload — same checkpoint data, written to a folder on disk
+// in parallel with IndexedDB. If IDB gets evicted or corrupted the
+// resume flow falls back to disk transparently.
+//
+// On the web build the bridge isn't present, so the helpers become
+// no-ops and only IDB is used.
+// ---------------------------------------------------------------------
+
+interface DiskCheckpointAPI {
+  saveMeta: (sessionId: string, meta: SessionMeta) => Promise<void>;
+  writeChapter: (
+    sessionId: string,
+    chapterIndex: number,
+    entry: Omit<CombinedChapterEntry, "blobs"> & { blobs: [] },
+    blobBuffers: ArrayBuffer[],
+  ) => Promise<void>;
+  readSession: (sessionId: string) => Promise<{
+    meta: SessionMeta;
+    chapters: Array<{
+      entry: Omit<CombinedChapterEntry, "blobs"> & {
+        blobs?: unknown;
+        chapterIndex: number;
+      };
+      blobBuffers: ArrayBuffer[];
+    }>;
+  } | null>;
+  listSessions: () => Promise<
+    Array<{ meta: SessionMeta; checkpointCount: number }>
+  >;
+  deleteSession: (sessionId: string) => Promise<void>;
+  baseDir: () => Promise<string>;
+  openFolder: (sessionId: string | null) => Promise<void>;
+}
+
+interface ManhwaAppBridge {
+  isDesktop?: boolean;
+  platform?: string;
+  version?: string;
+  diskCheckpoint?: DiskCheckpointAPI;
+}
+
+declare global {
+  interface Window {
+    manhwaApp?: ManhwaAppBridge;
+  }
+}
+
+function disk(): DiskCheckpointAPI | null {
+  if (typeof window === "undefined") return null;
+  return window.manhwaApp?.diskCheckpoint ?? null;
+}
+
 /** Stale sessions get pruned after this — they're almost certainly abandoned. */
 const SESSION_TTL_DAYS = 7;
 
@@ -143,6 +199,12 @@ export async function saveSession(meta: SessionMeta): Promise<void> {
   await tx(db, [STORE_SESSIONS], "readwrite", (t) => {
     t.objectStore(STORE_SESSIONS).put(meta);
   });
+  // Disk mirror (desktop only). Fire-and-forget so a slow disk write
+  // doesn't stall the chapter pipeline. Errors are logged but don't
+  // surface — IDB already succeeded.
+  disk()
+    ?.saveMeta(meta.id, meta)
+    .catch((err) => console.warn("Disk session save failed:", err));
 }
 
 /** Read a single session by id. */
@@ -157,23 +219,42 @@ export async function loadSession(id: string): Promise<SessionMeta | null> {
 }
 
 /**
- * List all incomplete sessions (newest first). Stale ones (older than
- * ``SESSION_TTL_DAYS``) are deleted as a side-effect. Returns at most
- * 10 — there's no realistic case for more.
+ * List all incomplete sessions (newest first). Merges sessions from
+ * IndexedDB with the disk backup so a browser cache wipe doesn't
+ * hide recoverable runs. Stale entries (older than
+ * ``SESSION_TTL_DAYS``, or already complete) are deleted as a
+ * side-effect.
  */
 export async function listActiveSessions(): Promise<SessionMeta[]> {
   const db = await openDb();
-  const all = await new Promise<SessionMeta[]>((resolve, reject) => {
+  const fromIdb = await new Promise<SessionMeta[]>((resolve, reject) => {
     const t = db.transaction(STORE_SESSIONS, "readonly");
     const req = t.objectStore(STORE_SESSIONS).getAll();
     req.onsuccess = () => resolve(req.result ?? []);
     req.onerror = () => reject(req.error);
   });
 
+  // Disk-side sessions (desktop only) — merge into the same set by ID.
+  let fromDisk: SessionMeta[] = [];
+  const diskApi = disk();
+  if (diskApi) {
+    try {
+      const rows = await diskApi.listSessions();
+      fromDisk = rows.map((r) => r.meta);
+    } catch (err) {
+      console.warn("Disk session list failed:", err);
+    }
+  }
+
+  // Dedupe by id — IDB metadata wins on overlap (it's the primary source).
+  const byId = new Map<string, SessionMeta>();
+  for (const s of fromDisk) byId.set(s.id, s);
+  for (const s of fromIdb) byId.set(s.id, s);
+  const all = [...byId.values()];
+
   const ttlCutoff = Date.now() - SESSION_TTL_DAYS * 24 * 60 * 60 * 1000;
   const stale = all.filter((s) => s.startedAt < ttlCutoff || s.isComplete);
   for (const s of stale) {
-    // Fire-and-forget cleanup; UI doesn't wait on this.
     deleteSession(s.id).catch(() => {});
   }
 
@@ -197,34 +278,90 @@ export async function saveCheckpoint(
       entry,
     });
   });
+
+  // Disk mirror (desktop only). Convert blobs to ArrayBuffers so IPC
+  // can transport them, then strip blobs from the entry JSON (the
+  // images get written as proper .jpg files on disk).
+  const diskApi = disk();
+  if (diskApi) {
+    try {
+      const blobBuffers = await Promise.all(
+        entry.blobs.map((b) => b.arrayBuffer()),
+      );
+      // Strip blobs from the entry payload — they live as files on disk.
+      const { blobs: _drop, ...rest } = entry;
+      void _drop; // satisfy strict-unused
+      await diskApi.writeChapter(
+        sessionId,
+        chapterIndex,
+        { ...rest, blobs: [] },
+        blobBuffers,
+      );
+    } catch (err) {
+      console.warn("Disk checkpoint write failed (continuing on IDB):", err);
+    }
+  }
 }
 
 /**
- * Load all checkpoints for a session, returned as a sparse array
- * indexed by ``chapterIndex - 1`` (matches the in-memory
- * ``accumulated`` array in bulkQueue).
+ * Load all checkpoints for a session. Tries IndexedDB first; if it's
+ * empty (e.g. browser cache cleared but the desktop disk backup is
+ * still around) falls back to reading from the disk folder via the
+ * Electron bridge.
  */
 export async function loadCheckpoints(
   sessionId: string,
 ): Promise<Map<number, CombinedChapterEntry>> {
   const db = await openDb();
-  return new Promise((resolve, reject) => {
-    const t = db.transaction(STORE_CHECKPOINTS, "readonly");
-    const idx = t.objectStore(STORE_CHECKPOINTS).index("bySession");
-    const req = idx.getAll(IDBKeyRange.only(sessionId));
-    req.onsuccess = () => {
-      const out = new Map<number, CombinedChapterEntry>();
-      for (const row of req.result as Array<{
-        sessionId: string;
-        chapterIndex: number;
-        entry: CombinedChapterEntry;
-      }>) {
-        out.set(row.chapterIndex, row.entry);
-      }
-      resolve(out);
-    };
-    req.onerror = () => reject(req.error);
-  });
+  const fromIdb = await new Promise<Map<number, CombinedChapterEntry>>(
+    (resolve, reject) => {
+      const t = db.transaction(STORE_CHECKPOINTS, "readonly");
+      const idx = t.objectStore(STORE_CHECKPOINTS).index("bySession");
+      const req = idx.getAll(IDBKeyRange.only(sessionId));
+      req.onsuccess = () => {
+        const out = new Map<number, CombinedChapterEntry>();
+        for (const row of req.result as Array<{
+          sessionId: string;
+          chapterIndex: number;
+          entry: CombinedChapterEntry;
+        }>) {
+          out.set(row.chapterIndex, row.entry);
+        }
+        resolve(out);
+      };
+      req.onerror = () => reject(req.error);
+    },
+  );
+
+  if (fromIdb.size > 0) return fromIdb;
+
+  // IDB miss — try disk (desktop only). Lets the user recover even
+  // after a browser data clear or quota eviction. Rehydrates Blobs
+  // from the ArrayBuffers the main process sends back.
+  const diskApi = disk();
+  if (!diskApi) return fromIdb;
+  try {
+    const result = await diskApi.readSession(sessionId);
+    if (!result || result.chapters.length === 0) return fromIdb;
+    const out = new Map<number, CombinedChapterEntry>();
+    for (const { entry, blobBuffers } of result.chapters) {
+      const blobs = blobBuffers.map(
+        (buf) => new Blob([buf], { type: "image/jpeg" }),
+      );
+      const reconstructed: CombinedChapterEntry = {
+        ...(entry as unknown as CombinedChapterEntry),
+        blobs,
+      };
+      out.set(reconstructed.chapterIndex, reconstructed);
+    }
+    console.log(
+      `[RESUME] Loaded ${out.size} chapter(s) from disk fallback for session ${sessionId}`,
+    );
+    return out;
+  } catch (err) {
+    console.warn("Disk checkpoint read failed:", err);
+    return fromIdb;
+  }
 }
 
 /** Delete a session AND all its checkpoints in one go. */
@@ -248,6 +385,12 @@ export async function deleteSession(sessionId: string): Promise<void> {
       };
     },
   );
+
+  // Mirror delete to disk so the user's checkpoint folder doesn't
+  // accumulate stale sessions.
+  disk()
+    ?.deleteSession(sessionId)
+    .catch((err) => console.warn("Disk session delete failed:", err));
 }
 
 /** Mark a session complete — keeps it in DB for one TTL window then prunes. */
