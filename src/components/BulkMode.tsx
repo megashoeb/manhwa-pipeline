@@ -46,6 +46,7 @@ import {
   type Series,
 } from "../core/seriesStore";
 import { generateSeriesEnding } from "../core/endingGenerator";
+import { readJson, writeJson } from "../core/storage";
 import { downloadCombinedRecap } from "../core/combinedDownload";
 
 import {
@@ -81,13 +82,30 @@ export function BulkMode({ rotator }: Props) {
   // story-driving panels (~15-30) and the queue produces ONE combined
   // ZIP at the end instead of per-chapter ZIPs. Designed for 70-80
   // chapter overnight runs that become a single 2-3 hour video.
-  const [longFormRecap, setLongFormRecap] = useState(false);
+  //
+  // Default ON — this is the primary mode the user actually uses; the
+  // old per-chapter mode is a niche fallback. User's choice persists
+  // to localStorage so a deliberate uncheck sticks across reloads.
+  const [longFormRecap, setLongFormRecap] = useState<boolean>(() =>
+    readJson<boolean>("manhwa.bulk.longFormRecap", true),
+  );
   // Parallel chapter processing — runs N chapters at once where N is
   // the number of enabled API keys. Big speedup for large runs at the
   // cost of slightly weaker cross-chapter narrative continuity
   // (chapter handoff becomes "last-completed sibling" instead of
-  // "strict chapter N-1"). Default OFF for spec compliance.
-  const [parallelChapters, setParallelChapters] = useState(false);
+  // "strict chapter N-1"). Default ON — most users want the speedup.
+  const [parallelChapters, setParallelChapters] = useState<boolean>(() =>
+    readJson<boolean>("manhwa.bulk.parallelChapters", true),
+  );
+
+  // Persist the two toggles whenever they change so a user who turns
+  // one off sees it stay off on the next reload.
+  useEffect(() => {
+    writeJson("manhwa.bulk.longFormRecap", longFormRecap);
+  }, [longFormRecap]);
+  useEffect(() => {
+    writeJson("manhwa.bulk.parallelChapters", parallelChapters);
+  }, [parallelChapters]);
   // Last successful combined-ZIP blob — populated after each long-form
   // run completes, so the user can re-download the archive without
   // re-running the queue. Cleared when a new run starts so the button

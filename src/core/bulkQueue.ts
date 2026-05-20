@@ -972,7 +972,19 @@ export async function runBulkQueue(
     }
   }
 
-  if (longFormRecap && orderedEntries.length > 0 && !abortSignal.aborted) {
+  // Build the combined ZIP whenever ANY chapter succeeded — even if
+  // the run was cancelled or some chapters failed. The user can then
+  // download the partial output via the manual button. Previously a
+  // cancel mid-run threw away the 20 completed chapters' worth of
+  // work, which the user explicitly called out as wrong:
+  //   "manual download hai na ki maan lo jab error bhi aye tb bhi
+  //    download option aaye"
+  //
+  // We only skip the combined-ZIP build when zero chapters succeeded
+  // (nothing to put in the ZIP) OR long-form mode is off (per-chapter
+  // mode delivers its own per-chapter ZIPs already).
+  if (longFormRecap && orderedEntries.length > 0) {
+    const wasAborted = abortSignal.aborted;
     if (appendToSeriesId) {
       // ---- Series-append mode ------------------------------------
       // Don't build a combined ZIP for this batch alone. Instead push
@@ -1030,16 +1042,20 @@ export async function runBulkQueue(
       return;
     }
 
+    const partialLabel = wasAborted ? "partial " : "";
     onProgress({
       itemIndex: -1,
       stage: "combining",
       current: 0,
       total: 1,
-      message: `Combining ${orderedEntries.length} chapters into one ZIP…`,
+      message:
+        `Combining ${orderedEntries.length} ${partialLabel}chapters into one ZIP…` +
+        (wasAborted ? " (run was cancelled — saving what we have)" : ""),
     });
     try {
+      const outputBase = wasAborted ? "longform_recap_PARTIAL" : "longform_recap";
       await downloadCombinedRecap(orderedEntries, {
-        outputName: `longform_recap_${orderedEntries.length}ch_${Date.now()}`,
+        outputName: `${outputBase}_${orderedEntries.length}ch_${Date.now()}`,
         onProgress: (c, t, msg) =>
           onProgress({
             itemIndex: -1,
@@ -1059,14 +1075,19 @@ export async function runBulkQueue(
         stage: "done",
         current: 1,
         total: 1,
-        message: `Combined ZIP downloaded — ${orderedEntries.length} chapters.`,
+        message: wasAborted
+          ? `Partial ZIP ready — ${orderedEntries.length} chapters saved (run was cancelled). Click Download to save.`
+          : `Combined ZIP ready — ${orderedEntries.length} chapters. Click Download to save.`,
       });
-      // Run finished cleanly — wipe checkpoint data. The user can
-      // still re-download via the "Download again" button (cached
-      // Blob in component state), so deleting IDB is safe here.
-      deleteSession(sessionId).catch((err) =>
-        console.warn("Session cleanup failed:", err),
-      );
+      // On a clean (non-aborted) run we wipe the checkpoint data —
+      // it served its purpose. On an ABORTED run we KEEP checkpoints
+      // so the user can resume next time by re-uploading the same
+      // PDFs and picking up from where they stopped.
+      if (!wasAborted) {
+        deleteSession(sessionId).catch((err) =>
+          console.warn("Session cleanup failed:", err),
+        );
+      }
     } catch (err) {
       // Combined-ZIP failure is loud — the user lost the chance to
       // grab per-chapter ZIPs (they were never created in this mode).
