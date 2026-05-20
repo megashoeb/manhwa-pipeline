@@ -9,6 +9,11 @@
 // per-minute / per-day caps.
 
 import type { KeyRotator } from "./keyRotator";
+import { callOpenRouter, OpenRouterError } from "./openRouterClient";
+import {
+  OPENROUTER_DEFAULT_MODEL,
+  OPENROUTER_MODEL_MAP,
+} from "./modelTiers";
 
 const ENDPOINT = "https://generativelanguage.googleapis.com/v1beta/models";
 
@@ -202,6 +207,48 @@ async function callWithRetries(
 
   for (let attempt = 0; attempt < MAX_ATTEMPTS; attempt++) {
     const apiKey = await rotator.pick();
+
+    // ---- Provider dispatch -----------------------------------------
+    // If the picked key belongs to OpenRouter, hand off the call to
+    // the OpenRouter client. Same retry loop position so failures
+    // here still feed the model-fallback chain. Rotator usage
+    // tracking + UI hooks are managed inside callOpenRouter.
+    const provider = rotator.getProvider(apiKey);
+    if (provider === "openrouter") {
+      const orModel =
+        rotator.getModelOverride(apiKey) ??
+        OPENROUTER_MODEL_MAP[modelId] ??
+        OPENROUTER_DEFAULT_MODEL;
+      try {
+        return await callOpenRouter(apiKey, rotator, {
+          model: orModel,
+          prompt: opts.prompt,
+          images: opts.images,
+          responseMimeType: opts.responseMimeType,
+          temperature: opts.temperature,
+          topP: opts.topP,
+          onKeyUsed: opts.onKeyUsed,
+        });
+      } catch (e) {
+        // OpenRouter failure — translate to GeminiError shape so the
+        // outer fallback-model logic can react. Most failures will
+        // bubble up; the outer ``generateContent`` decides whether to
+        // try a fallback model based on status.
+        lastErr = e;
+        if (e instanceof OpenRouterError) {
+          // Convert to GeminiError so outer fallback chain sees a
+          // consistent shape. Status codes map 1:1 (429 stays 429,
+          // 403 stays 403, etc.).
+          throw new GeminiError(
+            e.message,
+            e.status,
+            e.detail,
+          );
+        }
+        throw e;
+      }
+    }
+
     opts.onKeyUsed?.(maskKey(apiKey));
 
     let response: Response;

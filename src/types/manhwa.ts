@@ -125,6 +125,27 @@ export interface ApiKey {
    * exactly as before.
    */
   role?: "primary" | "backup";
+  /**
+   * Which API this key is for.
+   *   "gemini"     — Google AI Studio (default). Endpoint:
+   *                  generativelanguage.googleapis.com
+   *   "openrouter" — OpenRouter aggregator. Endpoint:
+   *                  openrouter.ai/api/v1/chat/completions
+   *                  Unlocks Qwen3.5-Flash + many other cheap models.
+   *
+   * The dispatcher in geminiClient inspects this field after the key
+   * rotator hands it a key and routes the call to the matching
+   * provider client. Omitted = "gemini" (backward compat).
+   */
+  provider?: "gemini" | "openrouter";
+  /**
+   * Optional per-key model override. When set, this exact model id is
+   * used regardless of what the pipeline stage requested. Mainly
+   * useful for OpenRouter keys where the user wants to pick a
+   * specific Qwen / DeepSeek / etc. model. Omit to let the dispatcher
+   * pick a sensible default per stage.
+   */
+  modelOverride?: string;
 }
 
 /** Per-key runtime usage tracking. Persisted in localStorage and reset daily. */

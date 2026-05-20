@@ -111,3 +111,36 @@ export const MODEL_RPM_LIMITS: Record<string, number> = {
   // Current single-model fallback used in pre-spec runs.
   "gemini-3.1-flash-lite": 4000,
 };
+
+/**
+ * Translate a pipeline-level Gemini model name to the OpenRouter
+ * equivalent. The dispatcher in geminiClient calls this when the
+ * key rotator hands it an OpenRouter key so the user's per-stage
+ * model preferences still resolve to a sensible model on that
+ * provider.
+ *
+ * Default for unknown models = Qwen3.5-Flash. It's:
+ *   • Vision-capable (handles curator + comprehend stages)
+ *   • Strong text generation (polish + segment + bridges)
+ *   • Cheapest VLM on OpenRouter ($0.065 input / $0.26 output per M
+ *     tokens, often with promo discounts)
+ *   • 1M token context (no truncation concerns)
+ *   • ~0.51s latency, 85 tps throughput — way faster than Gemini
+ *     preview models
+ *
+ * Users can override per-key via ApiKey.modelOverride to pick a
+ * specific Qwen / DeepSeek / Claude model instead.
+ */
+export const OPENROUTER_MODEL_MAP: Record<string, string> = {
+  // All current Gemini models → Qwen3.5-Flash (cheap + vision + fast).
+  "gemini-3.1-flash-lite": "qwen/qwen3.5-flash-02-23",
+  "gemini-2.5-flash": "qwen/qwen3.5-flash-02-23",
+  "gemini-2.0-flash": "qwen/qwen3.5-flash-02-23",
+  "gemini-2.0-flash-lite": "qwen/qwen3.5-flash-02-23",
+  "gemini-3-flash-preview": "qwen/qwen3.5-flash-02-23",
+  "gemini-3.1-pro-preview": "qwen/qwen3.6-plus", // step up for premium tier
+  "gemini-2.5-pro": "qwen/qwen3.6-plus",
+};
+
+/** Default OpenRouter model when no mapping exists for the requested Gemini model. */
+export const OPENROUTER_DEFAULT_MODEL = "qwen/qwen3.5-flash-02-23";

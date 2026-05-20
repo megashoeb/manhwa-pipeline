@@ -221,6 +221,37 @@ export class KeyRotator {
     ).length;
   }
 
+  /**
+   * Look up which provider a specific key belongs to. The dispatcher
+   * in geminiClient.generateContent calls this after rotator.pick()
+   * to decide whether to route the request to Gemini or OpenRouter.
+   * Returns "gemini" for unknown keys (safe fallback).
+   */
+  getProvider(value: string): "gemini" | "openrouter" {
+    const k = this.keys.find((k) => k.value === value);
+    return k?.provider ?? "gemini";
+  }
+
+  /**
+   * Optional per-key model override. Mainly used by OpenRouter keys
+   * where the user wants to pin a specific model (e.g.
+   * "qwen/qwen3.5-flash-02-23"). Returns null if not set.
+   */
+  getModelOverride(value: string): string | null {
+    const k = this.keys.find((k) => k.value === value);
+    return k?.modelOverride && k.modelOverride.trim() !== ""
+      ? k.modelOverride.trim()
+      : null;
+  }
+
+  /** True when at least one enabled OpenRouter key exists. */
+  hasOpenRouterKey(): boolean {
+    return this.keys.some(
+      (k) =>
+        k.enabled && k.value.trim() !== "" && k.provider === "openrouter",
+    );
+  }
+
   /** Mark a successful request against the given key. */
   recordSuccess(value: string): void {
     this.resetIfNewDay();

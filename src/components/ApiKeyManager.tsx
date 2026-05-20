@@ -22,6 +22,9 @@ export function ApiKeyManager({ rotator }: Props) {
   const [newValue, setNewValue] = useState("");
   const [newTier, setNewTier] = useState<"free" | "paid">("free");
   const [newRole, setNewRole] = useState<"primary" | "backup">("primary");
+  const [newProvider, setNewProvider] = useState<"gemini" | "openrouter">(
+    "gemini",
+  );
   const [showFull, setShowFull] = useState<Record<string, boolean>>({});
 
   // Re-render whenever the rotator's state changes (usage tick, add, etc.).
@@ -55,11 +58,13 @@ export function ApiKeyManager({ rotator }: Props) {
       enabled: true,
       tier: newTier,
       role: newRole,
+      provider: newProvider,
     });
     setNewLabel("");
     setNewValue("");
     setNewTier("free");
     setNewRole("primary");
+    setNewProvider("gemini");
     setAdding(false);
   }
 
@@ -157,6 +162,31 @@ export function ApiKeyManager({ rotator }: Props) {
                   )}
                 </button>
                 <div className="ml-auto flex items-center gap-3">
+                  {/* Provider selector — Gemini vs OpenRouter. Flip
+                      this and the dispatcher routes all subsequent
+                      calls through this key to that provider's API. */}
+                  <select
+                    value={k.provider ?? "gemini"}
+                    onChange={(e) =>
+                      rotator.update(k.value, {
+                        provider: e.target.value as "gemini" | "openrouter",
+                      })
+                    }
+                    className={clsx(
+                      "rounded border bg-zinc-950 px-1.5 py-0.5 text-[10px] font-semibold uppercase tracking-wide",
+                      k.provider === "openrouter"
+                        ? "border-indigo-500/60 text-indigo-300"
+                        : "border-zinc-700 text-zinc-400",
+                    )}
+                    title={
+                      k.provider === "openrouter"
+                        ? "OpenRouter — routes to Qwen3.5-Flash by default (vision + ~100x cheaper than Gemini preview)"
+                        : "Google Gemini — generativelanguage.googleapis.com"
+                    }
+                  >
+                    <option value="gemini">Gemini</option>
+                    <option value="openrouter">OpenRouter</option>
+                  </select>
                   {/* Tier selector — switch a key between free and paid
                       after creation. Paid keys bypass the rotator's
                       RPM/RPD caps and unlock high-concurrency mode. */}
@@ -211,12 +241,18 @@ export function ApiKeyManager({ rotator }: Props) {
                   <div
                     className={clsx(
                       "text-xs tabular-nums",
-                      k.tier === "paid" ? "text-amber-300/70" : "text-zinc-400",
+                      k.provider === "openrouter"
+                        ? "text-indigo-300/70"
+                        : k.tier === "paid"
+                          ? "text-amber-300/70"
+                          : "text-zinc-400",
                     )}
                   >
-                    {k.tier === "paid"
-                      ? `${usage.usageDay} calls today`
-                      : `${usage.usageDay}/${limits.dailyLimit}`}
+                    {k.provider === "openrouter"
+                      ? `${usage.usageDay} OR calls`
+                      : k.tier === "paid"
+                        ? `${usage.usageDay} calls today`
+                        : `${usage.usageDay}/${limits.dailyLimit}`}
                   </div>
                   <button
                     type="button"
@@ -276,6 +312,45 @@ export function ApiKeyManager({ rotator }: Props) {
                 className="rounded border border-zinc-700 bg-zinc-950 px-2 py-1 font-mono text-xs text-zinc-200 placeholder-zinc-600 focus:border-zinc-500 focus:outline-none"
               />
             </div>
+            <div className="flex items-center gap-3">
+              <label className="text-xs text-zinc-400">Provider:</label>
+              <label className="flex items-center gap-1 text-xs text-zinc-300">
+                <input
+                  type="radio"
+                  name="newProvider"
+                  checked={newProvider === "gemini"}
+                  onChange={() => setNewProvider("gemini")}
+                  className="accent-blue-500"
+                />
+                Google Gemini (AIzaSy…)
+              </label>
+              <label className="flex items-center gap-1 text-xs text-indigo-300">
+                <input
+                  type="radio"
+                  name="newProvider"
+                  checked={newProvider === "openrouter"}
+                  onChange={() => setNewProvider("openrouter")}
+                  className="accent-indigo-500"
+                />
+                OpenRouter (sk-or-…) — Qwen3.5-Flash, 100× cheaper
+              </label>
+            </div>
+            {newProvider === "openrouter" && (
+              <div className="rounded border border-indigo-700/40 bg-indigo-950/30 px-2 py-1.5 text-[11px] text-indigo-200">
+                Need an OpenRouter key?{" "}
+                <a
+                  href="https://openrouter.ai/settings/keys"
+                  target="_blank"
+                  rel="noreferrer"
+                  className="underline hover:text-indigo-100"
+                >
+                  Get one here
+                </a>
+                . Add $5 credit ≈ 1000 chapters' worth on Qwen3.5-Flash.
+                Tier/role still apply — but OpenRouter has no fixed RPM cap,
+                so Free + Paid behave the same for it.
+              </div>
+            )}
             <div className="flex items-center gap-3">
               <label className="text-xs text-zinc-400">Tier:</label>
               <label className="flex items-center gap-1 text-xs text-zinc-300">
@@ -339,6 +414,7 @@ export function ApiKeyManager({ rotator }: Props) {
                   setNewValue("");
                   setNewTier("free");
                   setNewRole("primary");
+                  setNewProvider("gemini");
                 }}
                 className="rounded border border-zinc-700 px-3 py-1 text-xs text-zinc-300 hover:bg-zinc-800"
               >
