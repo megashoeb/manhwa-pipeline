@@ -804,6 +804,27 @@ export async function runBulkQueue(
         `[CHAPTER ${i + 1}] attempt ${attempt + 1}/${CHAPTER_MAX_ATTEMPTS} failed:`,
         err,
       );
+      // Safety-filter blocks (status -2) are DETERMINISTIC — the
+      // same content will always trigger the same filter. Retrying
+      // 3 more times with 30/90/180s backoff just burns 5 minutes
+      // for no reason. Break out of the retry loop immediately so
+      // the chapter gets marked failed and the queue moves on to
+      // the next file. Fallback model was already tried inside
+      // geminiClient before this exception escaped.
+      const isSafety =
+        err != null &&
+        typeof err === "object" &&
+        "status" in err &&
+        (err as { status: unknown }).status === -2;
+      if (isSafety) {
+        try {
+          if (filterResult) revokeFilterResult(filterResult);
+          if (pages) revokeExtractedPages(pages);
+        } catch {
+          /* ignore */
+        }
+        break; // exit retry loop — fall through to "mark failed" below
+      }
       // Don't mark failed here — the retry loop will handle final
       // failure marking after all attempts are exhausted.
     } finally {

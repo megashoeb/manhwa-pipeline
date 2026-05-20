@@ -113,7 +113,28 @@ export async function generateContent(
   if (opts.responseMimeType)
     generationConfig.responseMimeType = opts.responseMimeType;
 
-  const body = { contents: [{ parts }], generationConfig };
+  // Disable Google's content safety filters wherever the API lets us.
+  // Manhwa narratives routinely depict combat, blood, character death,
+  // and other "elevated" content that the DEFAULT BLOCK_MEDIUM_AND_ABOVE
+  // threshold mis-classifies, killing chapters mid-batch. We're not
+  // generating user-facing chat; we're summarising licensed source
+  // material for the user's own video. BLOCK_NONE is the right floor.
+  //
+  // If Google rejects a category at BLOCK_NONE for the user's tier,
+  // the request still succeeds — the API will silently fall back to
+  // its own minimum for that one category. We never want to TIGHTEN,
+  // only loosen, so this is monotonically safe.
+  const safetySettings = [
+    { category: "HARM_CATEGORY_HARASSMENT", threshold: "BLOCK_NONE" },
+    { category: "HARM_CATEGORY_HATE_SPEECH", threshold: "BLOCK_NONE" },
+    { category: "HARM_CATEGORY_SEXUALLY_EXPLICIT", threshold: "BLOCK_NONE" },
+    { category: "HARM_CATEGORY_DANGEROUS_CONTENT", threshold: "BLOCK_NONE" },
+    // CIVIC_INTEGRITY exists on newer models. Setting it is safe even
+    // on older models that don't recognise the category (API ignores).
+    { category: "HARM_CATEGORY_CIVIC_INTEGRITY", threshold: "BLOCK_NONE" },
+  ];
+
+  const body = { contents: [{ parts }], generationConfig, safetySettings };
 
   // Primary model attempt with full retry budget.
   try {
@@ -137,20 +158,25 @@ export async function generateContent(
     //           assumed a model that doesn't exist on the user's
     //           endpoint yet). Same recovery path as 403.
     //
-    // Other errors (server outage, safety filter, malformed request,
-    // network) pass through unchanged — switching model wouldn't help.
+    // Other errors (server outage, malformed request, network) pass
+    // through unchanged — switching model wouldn't help. Safety
+    // blocks (-2) DO fall back because different models often have
+    // different filter trigger profiles for the same content.
     const shouldFallback =
       primaryErr instanceof GeminiError &&
       (primaryErr.status === 429 ||
         primaryErr.status === 403 ||
-        primaryErr.status === 404);
+        primaryErr.status === 404 ||
+        primaryErr.status === -2);
     if (opts.fallbackModel && shouldFallback && primaryErr instanceof GeminiError) {
       const reason =
         primaryErr.status === 429
           ? "exhausted rate-limit budget"
           : primaryErr.status === 403
             ? "is not accessible to this API key (HTTP 403)"
-            : "is not recognised by the API (HTTP 404)";
+            : primaryErr.status === 404
+              ? "is not recognised by the API (HTTP 404)"
+              : "was blocked by Google's safety filter";
       console.warn(
         `Primary model "${opts.model}" ${reason}. ` +
           `Falling back to "${opts.fallbackModel}".`,
@@ -258,17 +284,23 @@ async function callWithRetries(
 
     const candidate = data.candidates?.[0];
     if (!candidate) {
+      // No candidates usually means the PROMPT itself was blocked
+      // before any response was generated. Use the distinct safety
+      // status so the outer fallback handler routes to a different
+      // model (sometimes flash-lite blocks where flash-preview doesn't,
+      // and vice versa).
       throw new GeminiError(
-        "Gemini returned no candidates (likely blocked by a safety filter).",
-        0,
+        "Gemini returned no candidates (prompt likely blocked by safety filter).",
+        -2,
         JSON.stringify(data).slice(0, 800),
       );
     }
     if (candidate.finishReason === "SAFETY") {
       throw new GeminiError(
         "Response blocked by Gemini's safety filter. " +
-          "Try lowering the violence content of the panel batch or split the scene.",
-        0,
+          "Even with BLOCK_NONE thresholds, Google enforces a non-overridable hard filter for certain content. " +
+          "Skip this chapter or remove the offending panels before re-processing.",
+        -2,
         JSON.stringify(candidate.safetyRatings).slice(0, 800),
       );
     }
