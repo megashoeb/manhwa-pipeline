@@ -171,6 +171,18 @@ export interface RunBulkQueueOptions {
    * long-form mode (no combined ZIP in single-chapter mode).
    */
   onArchiveReady?: (blob: Blob, filename: string) => void;
+  /**
+   * Per-chapter ZIP delivery in NORMAL (non-long-form) mode. When
+   * provided, the chapter's ZIP blob is surfaced through this
+   * callback instead of being auto-downloaded — the UI can stash
+   * each blob and offer manual "Download chapter N" buttons. When
+   * omitted, per-chapter ZIPs auto-download as before.
+   */
+  onChapterArchive?: (
+    fileIndex: number,
+    blob: Blob,
+    filename: string,
+  ) => void;
   /** Lets the UI display which API key handled the current request. */
   onKeyUsed?: (masked: string) => void;
   /** Aborted between chapters (mid-chapter aborts are not supported). */
@@ -224,6 +236,7 @@ export async function runBulkQueue(
     onProgress,
     onMasterBibleUpdate,
     onArchiveReady,
+    onChapterArchive,
     onKeyUsed,
     abortSignal,
     sessionId: resumedSessionId,
@@ -762,11 +775,20 @@ export async function runBulkQueue(
           total: 1,
           message: `Zipping ${file.name}`,
         });
+        // When the UI provided ``onChapterArchive``, capture the
+        // blob there instead of auto-downloading. This is how the
+        // "manual-only download" mode works in BulkMode.
         await downloadFullOutputs(
           trimmed.pages,
           script,
           trimmed.stats,
           file.name,
+          onChapterArchive
+            ? {
+                onArchiveReady: (blob, fname) =>
+                  onChapterArchive(i, blob, fname),
+              }
+            : undefined,
         );
 
         onItemUpdate(i, {
@@ -1005,9 +1027,11 @@ export async function runBulkQueue(
             total: t,
             message: msg,
           }),
-        // Bubble the final blob up to the UI so a "Download again"
-        // button can re-trigger download without re-running the queue.
+        // Bubble the final blob up to the UI. Auto-download is OFF —
+        // the user explicitly asked to disable it; they download
+        // manually via the DownloadAgainCard button using this blob.
         onArchiveReady,
+        skipAutoDownload: true,
       });
       onProgress({
         itemIndex: -1,

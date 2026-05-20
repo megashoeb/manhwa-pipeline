@@ -98,6 +98,12 @@ export function BulkMode({ rotator }: Props) {
     chapters: number;
     at: number; // Date.now() — for "downloaded N seconds ago" UI
   } | null>(null);
+  // Per-chapter ZIPs (normal mode only) — accumulated so the user can
+  // manually download each chapter's archive. Indexed by file-index in
+  // the queue so we can pair each entry with its filename + status.
+  const [chapterZips, setChapterZips] = useState<
+    Map<number, { blob: Blob; filename: string; at: number }>
+  >(new Map());
 
   const [busy, setBusy] = useState(false);
   // Per-item progress map — in parallel mode multiple chapters fire
@@ -324,6 +330,9 @@ export function BulkMode({ rotator }: Props) {
       await downloadCombinedRecap(finalEntries, {
         outputName: `${safeTitle}_FINAL_${chapters.length}ch_${Date.now()}`,
         onProgress: (c, t, msg) => setSeriesStatus(`${msg} (${c}/${t})`),
+        // Manual-only download flow — the user clicks the Download
+        // button on the DownloadAgainCard that appears when lastZip
+        // is set. No browser auto-download fires.
         onArchiveReady: (blob, filename) => {
           setLastZip({
             blob,
@@ -332,6 +341,7 @@ export function BulkMode({ rotator }: Props) {
             at: Date.now(),
           });
         },
+        skipAutoDownload: true,
       });
       await markSeriesFinalized(activeSeries.id);
       await refreshSeries();
@@ -450,6 +460,7 @@ export function BulkMode({ rotator }: Props) {
     // Clear any stale "Download again" blob from a previous run — the
     // new run will produce a fresh archive.
     setLastZip(null);
+    setChapterZips(new Map());
     // Wipe any leftover progress state from a prior run.
     setProgressByItem(new Map());
     setCrossProgress(null);
@@ -544,15 +555,28 @@ export function BulkMode({ rotator }: Props) {
         });
       },
       onMasterBibleUpdate: (bible) => setMasterBible(bible),
-      // Capture the final combined-ZIP blob so the user can hit
-      // "Download again" after the run finishes. The auto-download
-      // ALSO fires (this callback is fire-and-store, not a replacement).
+      // Capture the final combined-ZIP blob so the user can hit the
+      // manual "Download" button. Auto-download is OFF per user
+      // preference — the DownloadAgainCard below is the sole download
+      // trigger.
       onArchiveReady: (blob, filename) => {
         setLastZip({
           blob,
           filename,
           chapters: items.filter((it) => it.status !== "failed").length,
           at: Date.now(),
+        });
+      },
+      // Per-chapter mode: capture each chapter's ZIP blob into a Map
+      // keyed by original file index. The UI renders one download
+      // button per completed chapter.
+      onChapterArchive: (queueIdx, blob, filename) => {
+        const realIdx = indexMap.get(queueFiles[queueIdx]);
+        if (realIdx == null) return;
+        setChapterZips((prev) => {
+          const next = new Map(prev);
+          next.set(realIdx, { blob, filename, at: Date.now() });
+          return next;
         });
       },
       onKeyUsed: (m) => setCurrentKey(m),
@@ -900,16 +924,29 @@ export function BulkMode({ rotator }: Props) {
               </button>
             </div>
           )}
-          {/* Re-download button — shows when a combined ZIP is in
-              memory. Lets the user trigger another download without
-              re-running the queue (useful if the auto-download was
-              dismissed / lost / saved to wrong folder). */}
-          {lastZip && !busy && (
+          {/* Combined-ZIP download (long-form mode + series finalize).
+              The ZIP blob is held in memory; auto-download is OFF per
+              user preference, so this button is the sole download
+              trigger. Click multiple times to download again. */}
+          {lastZip && (
             <DownloadAgainCard
               filename={lastZip.filename}
               chapters={lastZip.chapters}
               sizeBytes={lastZip.blob.size}
               onDownload={() => triggerBlobDownload(lastZip.blob, lastZip.filename)}
+            />
+          )}
+          {/* Per-chapter downloads (normal mode). One button per
+              completed chapter — appears as chapters finish so the
+              user can grab them mid-run without waiting for the
+              entire queue. */}
+          {chapterZips.size > 0 && (
+            <ChapterDownloadList
+              items={items}
+              chapterZips={chapterZips}
+              onDownload={(blob, filename) =>
+                triggerBlobDownload(blob, filename)
+              }
             />
           )}
           <QueueList
@@ -1250,6 +1287,69 @@ function triggerBlobDownload(blob: Blob, filename: string): void {
   window.setTimeout(() => URL.revokeObjectURL(url), 1000);
 }
 
+/**
+ * Per-chapter download list — used in NORMAL (non-long-form) mode
+ * where each chapter produces its own ZIP. Auto-download is disabled
+ * per user preference, so this list is the only way to retrieve
+ * completed chapter archives. Renders as chapters finish so the user
+ * can pull them mid-run.
+ */
+function ChapterDownloadList({
+  items,
+  chapterZips,
+  onDownload,
+}: {
+  items: QueueItem[];
+  chapterZips: Map<number, { blob: Blob; filename: string; at: number }>;
+  onDownload: (blob: Blob, filename: string) => void;
+}) {
+  // Sort by file index (preserves queue order).
+  const entries = [...chapterZips.entries()].sort((a, b) => a[0] - b[0]);
+  return (
+    <div className="mt-3 rounded border border-emerald-700/40 bg-emerald-950/20 p-3">
+      <div className="mb-2 flex items-center justify-between">
+        <div className="flex items-center gap-2 text-xs font-semibold text-emerald-200">
+          <Download className="h-3.5 w-3.5" />
+          Chapter ZIPs ready ({entries.length})
+        </div>
+        <button
+          type="button"
+          onClick={() => {
+            for (const [, z] of entries) onDownload(z.blob, z.filename);
+          }}
+          className="rounded bg-emerald-700 px-2.5 py-1 text-[11px] font-semibold text-white hover:bg-emerald-600"
+          title="Download every completed chapter ZIP in one click"
+        >
+          Download all
+        </button>
+      </div>
+      <div className="grid gap-1.5 sm:grid-cols-2 lg:grid-cols-3">
+        {entries.map(([idx, z]) => {
+          const it = items[idx];
+          const label = it?.file.name.replace(/\.pdf$/i, "") ?? z.filename;
+          const sizeMb = (z.blob.size / 1024 / 1024).toFixed(1);
+          return (
+            <button
+              key={idx}
+              type="button"
+              onClick={() => onDownload(z.blob, z.filename)}
+              className="flex items-center justify-between gap-2 rounded border border-emerald-700/40 bg-zinc-950/50 px-2 py-1.5 text-[11px] text-emerald-100 hover:border-emerald-500 hover:bg-emerald-950/40"
+              title={`${z.filename} (${sizeMb} MB)`}
+            >
+              <span className="truncate">
+                Ch {idx + 1} — {label}
+              </span>
+              <span className="shrink-0 text-emerald-300/60">
+                {sizeMb} MB
+              </span>
+            </button>
+          );
+        })}
+      </div>
+    </div>
+  );
+}
+
 function DownloadAgainCard({
   filename,
   chapters,
@@ -1272,7 +1372,7 @@ function DownloadAgainCard({
         </div>
         <div className="truncate text-[11px] text-zinc-500">
           <code className="font-mono">{filename}</code> &middot; {sizeMB} MB
-          &middot; already downloaded automatically
+          &middot; click Download to save (auto-download disabled)
         </div>
       </div>
       <button
@@ -1281,7 +1381,7 @@ function DownloadAgainCard({
         className="flex items-center gap-1.5 rounded bg-emerald-600 px-3 py-1.5 text-xs font-semibold text-white hover:bg-emerald-500"
       >
         <Download className="h-3.5 w-3.5" />
-        Download again
+        Download
       </button>
     </div>
   );

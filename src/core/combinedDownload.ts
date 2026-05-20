@@ -96,13 +96,20 @@ export interface CombinedDownloadOptions {
   secondsPerLine?: number;
   onProgress?: (current: number, total: number, msg: string) => void;
   /**
-   * Fired with the final ZIP blob + filename right before the auto-
-   * download triggers. Caller can store the blob in state to enable a
-   * manual "Download again" button — the auto-download still proceeds
-   * regardless. Useful for cases where the user wants to re-download
-   * after closing the original file or accidentally moving it.
+   * Fired with the final ZIP blob + filename as soon as it's built.
+   * Caller can store the blob in state to drive a manual "Download"
+   * button — and when ``skipAutoDownload`` is true, this callback is
+   * the ONLY way the user gets the file.
    */
   onArchiveReady?: (blob: Blob, filename: string) => void;
+  /**
+   * When true, the function builds the ZIP and fires
+   * ``onArchiveReady`` but does NOT trigger a browser auto-download.
+   * The user-facing "Download" button in the UI is the sole download
+   * trigger. Default false preserves the old auto-download behaviour
+   * for any callers that don't explicitly opt out.
+   */
+  skipAutoDownload?: boolean;
 }
 
 /**
@@ -380,10 +387,14 @@ export async function downloadCombinedRecap(
   );
 
   const archiveFilename = `${outputName}.zip`;
-  // Expose the blob BEFORE saveBlob revokes its URL. Caller can store
-  // a reference for re-download or alternate handling.
+  // Expose the blob BEFORE any save. Caller can store a reference
+  // for the manual Download button (and that's the ONLY path when
+  // skipAutoDownload is true — user explicitly asked: "auto download
+  // hata do, sirf manually nikaluga").
   options.onArchiveReady?.(archive, archiveFilename);
-  saveBlob(archive, archiveFilename);
+  if (!options.skipAutoDownload) {
+    saveBlob(archive, archiveFilename);
+  }
 }
 
 // ---------------------------------------------------------------------

@@ -49,11 +49,28 @@ function saveBlob(blob: Blob, filename: string): void {
  * Optional progress callback fires as each panel is added so the UI
  * can show a "{n} of {total}" message during large archives.
  */
+export interface DownloadCallbacks {
+  /** Per-file progress within the ZIP build. */
+  onProgress?: (current: number, total: number) => void;
+  /**
+   * Fired with the finished blob + filename. When this is provided the
+   * function does NOT trigger a browser auto-download — the caller
+   * is expected to expose a manual "Download" button using the blob.
+   */
+  onArchiveReady?: (blob: Blob, filename: string) => void;
+}
+
 export async function downloadKeptImagesZip(
   pages: FilteredPage[],
   filename: string | null,
-  onProgress?: (current: number, total: number) => void,
+  onProgressOrCallbacks?:
+    | ((current: number, total: number) => void)
+    | DownloadCallbacks,
 ): Promise<void> {
+  const callbacks: DownloadCallbacks =
+    typeof onProgressOrCallbacks === "function"
+      ? { onProgress: onProgressOrCallbacks }
+      : (onProgressOrCallbacks ?? {});
   const kept = pages.filter((p) => p.kept);
   if (kept.length === 0) {
     throw new Error("No kept pages to download. Adjust filter settings first.");
@@ -63,14 +80,20 @@ export async function downloadKeptImagesZip(
   for (let i = 0; i < kept.length; i++) {
     const seq = String(i + 1).padStart(4, "0");
     zip.file(`${seq}.jpg`, kept[i].blob);
-    onProgress?.(i + 1, kept.length);
+    callbacks.onProgress?.(i + 1, kept.length);
   }
 
   // ZIP_STORED is fastest and JPEGs barely compress anyway. We use
   // the default (DEFLATE level 6) here just in case future outputs
   // include text/JSON that would compress meaningfully.
   const archive = await zip.generateAsync({ type: "blob" });
-  saveBlob(archive, `${basename(filename)}_images.zip`);
+  const archiveFilename = `${basename(filename)}_images.zip`;
+  if (callbacks.onArchiveReady) {
+    // Caller-driven manual download flow.
+    callbacks.onArchiveReady(archive, archiveFilename);
+  } else {
+    saveBlob(archive, archiveFilename);
+  }
 }
 
 /**
@@ -84,8 +107,14 @@ export async function downloadFullOutputs(
   script: ScriptResult,
   stats: FilterStats,
   filename: string | null,
-  onProgress?: (current: number, total: number) => void,
+  onProgressOrCallbacks?:
+    | ((current: number, total: number) => void)
+    | DownloadCallbacks,
 ): Promise<void> {
+  const callbacks: DownloadCallbacks =
+    typeof onProgressOrCallbacks === "function"
+      ? { onProgress: onProgressOrCallbacks }
+      : (onProgressOrCallbacks ?? {});
   const baseName = basename(filename);
   const kept = pages.filter((p) => p.kept);
 
@@ -98,12 +127,12 @@ export async function downloadFullOutputs(
   for (let i = 0; i < kept.length; i++) {
     const seq = String(i + 1).padStart(4, "0");
     imagesFolder.file(`${seq}.jpg`, kept[i].blob);
-    onProgress?.(i + 1, kept.length + 4); // +4 for script/bible/manifest/readme
+    callbacks.onProgress?.(i + 1, kept.length + 4); // +4 for script/bible/manifest/readme
   }
 
   // 2) Narration script — the file the user pastes into MegaShoeb TTS.
   zip.file(`${baseName}_script.txt`, script.scriptText);
-  onProgress?.(kept.length + 1, kept.length + 4);
+  callbacks.onProgress?.(kept.length + 1, kept.length + 4);
 
   // 3) Character bible — useful both for the next chapter's continuity
   //    and for the user to manually patch character names if needed.
@@ -111,7 +140,7 @@ export async function downloadFullOutputs(
     `${baseName}_bible.json`,
     JSON.stringify(script.bible, null, 2),
   );
-  onProgress?.(kept.length + 2, kept.length + 4);
+  callbacks.onProgress?.(kept.length + 2, kept.length + 4);
 
   // 4) Manifest — full record of every panel decision + every scene.
   //    Lets the user debug "why was page 14 dropped?" months later.
@@ -141,18 +170,23 @@ export async function downloadFullOutputs(
     bible: script.bible,
   };
   zip.file(`${baseName}_manifest.json`, JSON.stringify(manifest, null, 2));
-  onProgress?.(kept.length + 3, kept.length + 4);
+  callbacks.onProgress?.(kept.length + 3, kept.length + 4);
 
   // 5) README — quick reference for the rest of the workflow.
   zip.file(`README.txt`, buildReadme(baseName, stats, kept.length));
-  onProgress?.(kept.length + 4, kept.length + 4);
+  callbacks.onProgress?.(kept.length + 4, kept.length + 4);
 
   const archive = await zip.generateAsync({
     type: "blob",
     compression: "DEFLATE",
     compressionOptions: { level: 6 },
   });
-  saveBlob(archive, `${baseName}_outputs.zip`);
+  const archiveFilename = `${baseName}_outputs.zip`;
+  if (callbacks.onArchiveReady) {
+    callbacks.onArchiveReady(archive, archiveFilename);
+  } else {
+    saveBlob(archive, archiveFilename);
+  }
 }
 
 function buildReadme(
