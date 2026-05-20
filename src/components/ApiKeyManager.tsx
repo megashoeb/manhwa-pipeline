@@ -21,6 +21,7 @@ export function ApiKeyManager({ rotator }: Props) {
   const [newLabel, setNewLabel] = useState("");
   const [newValue, setNewValue] = useState("");
   const [newTier, setNewTier] = useState<"free" | "paid">("free");
+  const [newRole, setNewRole] = useState<"primary" | "backup">("primary");
   const [showFull, setShowFull] = useState<Record<string, boolean>>({});
 
   // Re-render whenever the rotator's state changes (usage tick, add, etc.).
@@ -37,15 +38,28 @@ export function ApiKeyManager({ rotator }: Props) {
       0,
     );
   const paidCount = keys.filter((k) => k.enabled && k.tier === "paid").length;
+  const primaryCount = keys.filter(
+    (k) => k.enabled && k.role !== "backup",
+  ).length;
+  const backupCount = keys.filter(
+    (k) => k.enabled && k.role === "backup",
+  ).length;
 
   function submit() {
     const value = newValue.trim();
     if (!value) return;
     const label = newLabel.trim() || `Key ${keys.length + 1}`;
-    rotator.add({ value, label, enabled: true, tier: newTier });
+    rotator.add({
+      value,
+      label,
+      enabled: true,
+      tier: newTier,
+      role: newRole,
+    });
     setNewLabel("");
     setNewValue("");
     setNewTier("free");
+    setNewRole("primary");
     setAdding(false);
   }
 
@@ -60,7 +74,7 @@ export function ApiKeyManager({ rotator }: Props) {
           </span>
           {keys.length > 0 && (
             <span className="text-xs text-zinc-500">
-              ({keys.filter((k) => k.enabled).length} active
+              ({primaryCount} primary{backupCount > 0 && ` + ${backupCount} backup`}
               {paidCount > 0 && (
                 <span className="ml-1 rounded bg-amber-900/60 px-1 text-[10px] font-semibold uppercase tracking-wide text-amber-300">
                   {paidCount} paid
@@ -168,6 +182,32 @@ export function ApiKeyManager({ rotator }: Props) {
                     <option value="free">Free</option>
                     <option value="paid">Paid</option>
                   </select>
+                  {/* Role selector — primary keys are used in normal
+                      rotation; backups only kick in when all primaries
+                      are RPM-throttled / daily-capped. Independent of
+                      tier (you can have a paid backup or free primary). */}
+                  <select
+                    value={k.role ?? "primary"}
+                    onChange={(e) =>
+                      rotator.update(k.value, {
+                        role: e.target.value as "primary" | "backup",
+                      })
+                    }
+                    className={clsx(
+                      "rounded border bg-zinc-950 px-1.5 py-0.5 text-[10px] font-semibold uppercase tracking-wide",
+                      k.role === "backup"
+                        ? "border-zinc-500/70 text-zinc-300"
+                        : "border-zinc-700 text-zinc-400",
+                    )}
+                    title={
+                      k.role === "backup"
+                        ? "Backup — only used when every primary is currently rate-limited or daily-capped"
+                        : "Primary — used in the normal rotation pool"
+                    }
+                  >
+                    <option value="primary">Primary</option>
+                    <option value="backup">Backup</option>
+                  </select>
                   <div
                     className={clsx(
                       "text-xs tabular-nums",
@@ -259,6 +299,29 @@ export function ApiKeyManager({ rotator }: Props) {
                 Paid (no caps, unlocks 10× parallel)
               </label>
             </div>
+            <div className="flex items-center gap-3">
+              <label className="text-xs text-zinc-400">Role:</label>
+              <label className="flex items-center gap-1 text-xs text-zinc-300">
+                <input
+                  type="radio"
+                  name="newRole"
+                  checked={newRole === "primary"}
+                  onChange={() => setNewRole("primary")}
+                  className="accent-blue-500"
+                />
+                Primary (used in normal rotation)
+              </label>
+              <label className="flex items-center gap-1 text-xs text-zinc-400">
+                <input
+                  type="radio"
+                  name="newRole"
+                  checked={newRole === "backup"}
+                  onChange={() => setNewRole("backup")}
+                  className="accent-zinc-400"
+                />
+                Backup (only when primaries throttled)
+              </label>
+            </div>
             <div className="flex gap-2">
               <button
                 type="button"
@@ -275,6 +338,7 @@ export function ApiKeyManager({ rotator }: Props) {
                   setNewLabel("");
                   setNewValue("");
                   setNewTier("free");
+                  setNewRole("primary");
                 }}
                 className="rounded border border-zinc-700 px-3 py-1 text-xs text-zinc-300 hover:bg-zinc-800"
               >

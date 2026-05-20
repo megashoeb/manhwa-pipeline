@@ -113,6 +113,18 @@ export interface ApiKey {
    * Omitted on legacy ApiKey records — treated as "free" for backward compat.
    */
   tier?: "free" | "paid";
+  /**
+   * "primary" (default) — used in the normal rotation pool.
+   * "backup" — only picked when EVERY primary key is currently RPM-
+   * throttled or daily-capped. Useful when the user has one "good"
+   * key they want to prefer and a few spare keys they only want to
+   * burn through during a flood.
+   *
+   * Independent of ``tier`` — you can have a paid backup, a free
+   * primary, etc. Omitted = "primary" so existing keys keep behaving
+   * exactly as before.
+   */
+  role?: "primary" | "backup";
 }
 
 /** Per-key runtime usage tracking. Persisted in localStorage and reset daily. */

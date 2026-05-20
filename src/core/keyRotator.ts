@@ -109,10 +109,18 @@ export class KeyRotator {
   // ---- rotation ----------------------------------------------------
 
   /**
-   * Pick the next key to use. Waits (sleeps) when every FREE key is
-   * RPM-throttled. Paid keys never throttle (Gemini paid Tier 1 starts
-   * at ~1000 RPM with no daily cap — irrelevant for our use). Throws
-   * only when every key (free + paid) is unusable.
+   * Pick the next key to use. Pick order (first match wins):
+   *
+   *   1. Paid primary keys — bypass RPM/RPD entirely, least-used first.
+   *   2. Paid backup keys — same bypass, only consulted if no paid
+   *      primaries exist.
+   *   3. Free primary keys under both RPM + RPD caps, least-used first.
+   *   4. Free backup keys under caps — only if every free primary is
+   *      RPM-throttled OR daily-capped.
+   *   5. Sleep until the soonest free key clears its RPM window, then
+   *      recurse.
+   *
+   * Throws when every key (across tiers + roles) has hit its daily cap.
    */
   async pick(): Promise<string> {
     this.resetIfNewDay();
@@ -124,19 +132,25 @@ export class KeyRotator {
       );
     }
 
-    // Paid keys: bypass RPM/RPD entirely. We still track usage so the
-    // user can see stats, but a paid key is always immediately
-    // returnable. Prefer the least-used paid key so usage spreads
-    // across multiple paid keys if the user has more than one.
-    const paid = enabled.filter((k) => k.tier === "paid");
-    if (paid.length > 0) {
-      const sortedPaid = [...paid].sort(
+    const isBackup = (k: ApiKey) => k.role === "backup";
+    const isPrimary = (k: ApiKey) => !isBackup(k);
+
+    // ---- Paid keys (no caps) ---------------------------------------
+    // Paid primaries take absolute priority. Paid backups only kick in
+    // if the user has no paid primaries (i.e. they intentionally marked
+    // all paid keys as backup — unusual but supported).
+    const paidPrimary = enabled.filter((k) => k.tier === "paid" && isPrimary(k));
+    const paidBackup = enabled.filter((k) => k.tier === "paid" && isBackup(k));
+    const paidPool = paidPrimary.length > 0 ? paidPrimary : paidBackup;
+    if (paidPool.length > 0) {
+      const sorted = [...paidPool].sort(
         (a, b) => this.usage[a.value].usageDay - this.usage[b.value].usageDay,
       );
-      return sortedPaid[0].value;
+      return sorted[0].value;
     }
 
-    // Free keys only path. Filter out daily-capped keys.
+    // ---- Free keys (capped) ----------------------------------------
+    // Filter to keys still under their daily cap.
     const underDaily = enabled.filter(
       (k) => this.usage[k.value].usageDay < this.limits.dailyLimit,
     );
@@ -147,31 +161,50 @@ export class KeyRotator {
       );
     }
 
-    // Sort least-used first so we spread load across all available keys.
-    const sorted = [...underDaily].sort(
-      (a, b) => this.usage[a.value].usageDay - this.usage[b.value].usageDay,
-    );
+    // Try PRIMARY first. ``pickFromPool`` returns the least-used key
+    // that's also under the RPM cap; returns null if every key in the
+    // pool is RPM-throttled.
+    const primaryUnderDaily = underDaily.filter(isPrimary);
+    const primaryPick = this.pickFromPool(primaryUnderDaily);
+    if (primaryPick) return primaryPick;
 
-    // Walk in order; return the first key that's also under its RPM cap.
-    for (const k of sorted) {
-      if (this.requestsLastMinute(k.value) < this.limits.minuteLimit) {
-        return k.value;
-      }
-    }
+    // All primaries either RPM-throttled OR there are no primaries.
+    // Fall through to BACKUP keys.
+    const backupUnderDaily = underDaily.filter(isBackup);
+    const backupPick = this.pickFromPool(backupUnderDaily);
+    if (backupPick) return backupPick;
 
-    // Every healthy key is RPM-throttled. Wait the shortest amount of
-    // time needed before the oldest tracked request scrolls out of the
-    // 60-second window.
+    // Both pools throttled. Wait the shortest amount needed before
+    // the oldest tracked request scrolls out of the 60-second window
+    // ACROSS all under-daily keys (primary + backup) — sleeping
+    // longer for primary's benefit when backups exist would be silly.
     let minWait = 60_000;
-    for (const k of sorted) {
+    for (const k of underDaily) {
       const oldest = this.usage[k.value].recentRequests[0];
       if (oldest != null) {
         minWait = Math.min(minWait, oldest + 60_000 - Date.now());
       }
     }
     await sleep(Math.max(250, minWait + 100));
-    // After waiting, recurse — at least one key should now be available.
     return this.pick();
+  }
+
+  /**
+   * Return the least-used key in ``pool`` that's also under its RPM
+   * cap, or null when every key in the pool is RPM-throttled (or pool
+   * is empty). Pure helper, no side effects.
+   */
+  private pickFromPool(pool: ApiKey[]): string | null {
+    if (pool.length === 0) return null;
+    const sorted = [...pool].sort(
+      (a, b) => this.usage[a.value].usageDay - this.usage[b.value].usageDay,
+    );
+    for (const k of sorted) {
+      if (this.requestsLastMinute(k.value) < this.limits.minuteLimit) {
+        return k.value;
+      }
+    }
+    return null;
   }
 
   /** True when at least one enabled, working paid key exists. */
