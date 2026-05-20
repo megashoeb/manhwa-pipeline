@@ -23,7 +23,11 @@ import clsx from "clsx";
 import { FilterSettingsPanel } from "./FilterSettings";
 import { ApiKeyManager } from "./ApiKeyManager";
 
-import { runBulkQueue, type BulkProgressUpdate } from "../core/bulkQueue";
+import {
+  PauseController,
+  runBulkQueue,
+  type BulkProgressUpdate,
+} from "../core/bulkQueue";
 import { clearMasterBible, loadMasterBible } from "../core/masterBible";
 import {
   deleteSession,
@@ -111,6 +115,8 @@ export function BulkMode({ rotator }: Props) {
   const [bulkStartedAt, setBulkStartedAt] = useState<number | null>(null);
 
   const abortRef = useRef<AbortController | null>(null);
+  const pauseRef = useRef<PauseController | null>(null);
+  const [paused, setPaused] = useState(false);
   const inputRef = useRef<HTMLInputElement>(null);
   const [isDragging, setIsDragging] = useState(false);
 
@@ -448,6 +454,8 @@ export function BulkMode({ rotator }: Props) {
     setProgressByItem(new Map());
     setCrossProgress(null);
     abortRef.current = new AbortController();
+    pauseRef.current = new PauseController();
+    setPaused(false);
 
     // We pass the (re-)filtered list. Done items are skipped inside
     // the queue runner because their status will be "done" already.
@@ -549,9 +557,11 @@ export function BulkMode({ rotator }: Props) {
       },
       onKeyUsed: (m) => setCurrentKey(m),
       abortSignal: abortRef.current.signal,
+      pauseController: pauseRef.current,
     });
 
     setBusy(false);
+    setPaused(false);
     setProgressByItem(new Map());
     setCrossProgress(null);
     setCurrentKey(null);
@@ -586,6 +596,22 @@ export function BulkMode({ rotator }: Props) {
 
   function cancel() {
     abortRef.current?.abort();
+    // If paused when cancelled, also release any parked workers so
+    // they hit the abort check and exit instead of staying parked.
+    pauseRef.current?.resume();
+    setPaused(false);
+  }
+
+  function pauseRun() {
+    if (!pauseRef.current) return;
+    pauseRef.current.pause();
+    setPaused(true);
+  }
+
+  function resumeRun() {
+    if (!pauseRef.current) return;
+    pauseRef.current.resume();
+    setPaused(false);
   }
 
   function resetBible() {
@@ -783,14 +809,44 @@ export function BulkMode({ rotator }: Props) {
                     : `Start bulk run (${items.length} chapters)`}
               </button>
             ) : (
-              <button
-                type="button"
-                onClick={cancel}
-                className="flex items-center gap-2 rounded bg-red-600 px-4 py-2 text-sm font-semibold text-white hover:bg-red-500"
-              >
-                <Square className="h-4 w-4" />
-                Cancel after current chapter
-              </button>
+              <>
+                {/* Pause / Resume — between-chapter pause. In-flight
+                    chapters finish their current Gemini stage, then
+                    workers idle. Resume unparks them. */}
+                {paused ? (
+                  <button
+                    type="button"
+                    onClick={resumeRun}
+                    className="flex items-center gap-2 rounded bg-emerald-600 px-4 py-2 text-sm font-semibold text-white hover:bg-emerald-500"
+                  >
+                    <Play className="h-4 w-4" />
+                    Resume
+                  </button>
+                ) : (
+                  <button
+                    type="button"
+                    onClick={pauseRun}
+                    className="flex items-center gap-2 rounded bg-amber-600 px-4 py-2 text-sm font-semibold text-white hover:bg-amber-500"
+                    title="In-flight chapters will finish before workers idle"
+                  >
+                    <Square className="h-4 w-4" />
+                    Pause
+                  </button>
+                )}
+                <button
+                  type="button"
+                  onClick={cancel}
+                  className="flex items-center gap-2 rounded bg-red-600 px-4 py-2 text-sm font-semibold text-white hover:bg-red-500"
+                >
+                  <Square className="h-4 w-4" />
+                  Cancel
+                </button>
+              </>
+            )}
+            {paused && (
+              <span className="rounded bg-amber-950/40 px-2 py-1 text-[11px] font-medium text-amber-300">
+                ⏸ Paused — in-flight chapters finishing, workers idle next
+              </span>
             )}
 
             {!hasAnyKey && (

@@ -82,6 +82,57 @@ export interface BulkProgressUpdate {
   message: string;
 }
 
+/**
+ * Cooperative pause primitive. Workers in the bulk pipeline call
+ * ``waitWhilePaused()`` between chapters (and during retry backoffs);
+ * the UI controls ``pause()`` / ``resume()`` from its Pause/Resume
+ * buttons.
+ *
+ * Pause is between-chapter — an in-flight chapter finishes its current
+ * pipeline stage before the worker idles. This avoids:
+ *   1. Wasted Gemini calls (a half-processed chapter throws away its
+ *      script).
+ *   2. Inconsistent checkpoint state (we'd save a partial entry).
+ *
+ * Resume restarts ALL waiters at once via stored resolve callbacks —
+ * no polling, no setTimeout dance.
+ */
+export class PauseController {
+  private paused = false;
+  private resolvers: Array<() => void> = [];
+
+  /** Mark paused. Subsequent ``waitWhilePaused()`` calls block. */
+  pause(): void {
+    this.paused = true;
+  }
+
+  /** Resume — releases every waiter currently parked on this controller. */
+  resume(): void {
+    this.paused = false;
+    const old = this.resolvers;
+    this.resolvers = [];
+    for (const r of old) r();
+  }
+
+  /** Snapshot of the paused state — read by the UI for label flipping. */
+  get isPaused(): boolean {
+    return this.paused;
+  }
+
+  /**
+   * Resolves immediately if not paused. Otherwise returns a Promise
+   * that resolves the next time ``resume()`` is called. Workers
+   * ``await`` this between chapters; if multiple workers are parked
+   * they all release together when the user clicks Resume.
+   */
+  waitWhilePaused(): Promise<void> {
+    if (!this.paused) return Promise.resolve();
+    return new Promise((resolve) => {
+      this.resolvers.push(resolve);
+    });
+  }
+}
+
 export interface RunBulkQueueOptions {
   files: File[];
   rotator: KeyRotator;
@@ -141,6 +192,14 @@ export interface RunBulkQueueOptions {
    * with AI-generated outro). Long-form mode only.
    */
   appendToSeriesId?: string;
+  /**
+   * Optional pause controller. When provided, workers will idle
+   * between chapters whenever ``pauseController.isPaused`` is true.
+   * Pause is cooperative and between-chapter only — the current
+   * chapter finishes its pipeline before the worker waits, so no
+   * half-processed checkpoint or wasted Gemini call.
+   */
+  pauseController?: PauseController;
 }
 
 /**
@@ -169,6 +228,7 @@ export async function runBulkQueue(
     abortSignal,
     sessionId: resumedSessionId,
     appendToSeriesId,
+    pauseController,
   } = opts;
 
   let masterBible = loadMasterBible();
@@ -380,10 +440,20 @@ export async function runBulkQueue(
             `Chapter ${i + 1} failed — retrying in ${delayMs / 1000}s ` +
             `(attempt ${attempt + 1}/${CHAPTER_MAX_ATTEMPTS})`,
         });
-        const sleepStart = Date.now();
-        while (Date.now() - sleepStart < delayMs) {
+        // Sleep in 1s slices so abort signal stays responsive.
+        // If the user clicks Pause during the backoff, the paused
+        // duration does NOT count against ``delayMs`` — when they
+        // hit Resume the backoff continues from where it left off,
+        // so the rate-limit cooldown still gets its full elapsed
+        // wall-clock (otherwise pause would be a free quota bypass).
+        let elapsed = 0;
+        while (elapsed < delayMs) {
           if (abortSignal.aborted) return;
+          if (pauseController) await pauseController.waitWhilePaused();
+          if (abortSignal.aborted) return;
+          const sliceStart = Date.now();
           await new Promise((r) => setTimeout(r, 1000));
+          elapsed += Date.now() - sliceStart;
         }
       }
 
@@ -747,8 +817,17 @@ export async function runBulkQueue(
   // ``concurrency`` workers each pull chapters from the shared
   // ``claimNext`` counter until the queue is drained. Per-item
   // failures stay isolated; Promise.all waits for ALL workers.
+  //
+  // Pause is checked BETWEEN chapters — an in-flight chapter finishes
+  // its current pipeline before the worker idles. Means user clicking
+  // Pause might still see one or more chapters complete (whichever
+  // were mid-stage) before the queue actually stops claiming new ones.
   const worker = async (): Promise<void> => {
     while (true) {
+      if (pauseController) {
+        await pauseController.waitWhilePaused();
+      }
+      if (abortSignal.aborted) return;
       const i = claimNext();
       if (i === -1) return;
       await processChapter(i);
