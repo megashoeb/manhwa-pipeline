@@ -59,6 +59,11 @@ import {
   saveCheckpoint,
   saveSession,
 } from "./sessionStore";
+import {
+  appendChaptersToSeries,
+  loadSeries,
+  updateSeries,
+} from "./seriesStore";
 
 import type {
   CharacterBible,
@@ -127,6 +132,15 @@ export interface RunBulkQueueOptions {
    * for power-cut recovery.
    */
   sessionId?: string;
+  /**
+   * Append this batch's chapters to the given series instead of
+   * triggering a combined ZIP download. Used by the "Add to series"
+   * UI toggle — lets the user accumulate a 50-chapter project across
+   * multiple processing sessions over days/weeks, then finalize once
+   * via the "Finalize series" button (which produces the mega-ZIP
+   * with AI-generated outro). Long-form mode only.
+   */
+  appendToSeriesId?: string;
 }
 
 /**
@@ -154,6 +168,7 @@ export async function runBulkQueue(
     onKeyUsed,
     abortSignal,
     sessionId: resumedSessionId,
+    appendToSeriesId,
   } = opts;
 
   let masterBible = loadMasterBible();
@@ -330,6 +345,15 @@ export async function runBulkQueue(
 
   // Per-chapter processing — same logic as the old sequential loop,
   // now callable from any worker. ``i`` is the file-index slot.
+  //
+  // Wrapped in a 4-attempt retry loop (initial + 3 retries with
+  // 30s/90s/180s backoff between attempts) so transient Gemini
+  // failures don't kill the chapter for the whole bulk run. Common
+  // recoverable failures: 429 rate limit cascades, 503 model
+  // overload, network timeouts caught by geminiClient's 180s
+  // AbortController, JSON parse failures from a flaky response.
+  const CHAPTER_RETRY_BACKOFFS_MS = [30_000, 90_000, 180_000];
+  const CHAPTER_MAX_ATTEMPTS = CHAPTER_RETRY_BACKOFFS_MS.length + 1;
   const processChapter = async (i: number): Promise<void> => {
     // Skip chapters already loaded from a resumed session's checkpoints.
     // The UI was notified of their "done" status during the resume
@@ -338,7 +362,32 @@ export async function runBulkQueue(
       return;
     }
 
-    const file = files[i];
+    let lastErr: unknown = null;
+    let succeeded = false;
+
+    for (let attempt = 0; attempt < CHAPTER_MAX_ATTEMPTS; attempt++) {
+      if (abortSignal.aborted) return;
+      // Backoff sleep before retry attempts (not before the first one).
+      // Sleeps in 1-second slices so abort signal stays responsive.
+      if (attempt > 0) {
+        const delayMs = CHAPTER_RETRY_BACKOFFS_MS[attempt - 1];
+        onProgress({
+          itemIndex: i,
+          stage: "extracting",
+          current: 0,
+          total: 0,
+          message:
+            `Chapter ${i + 1} failed — retrying in ${delayMs / 1000}s ` +
+            `(attempt ${attempt + 1}/${CHAPTER_MAX_ATTEMPTS})`,
+        });
+        const sleepStart = Date.now();
+        while (Date.now() - sleepStart < delayMs) {
+          if (abortSignal.aborted) return;
+          await new Promise((r) => setTimeout(r, 1000));
+        }
+      }
+
+      const file = files[i];
     // Snapshot at claim time. In sequential mode (default for spec)
     // these are the strict previous chapter's values. In parallel
     // mode they're best-effort from whichever sibling chapter
@@ -627,6 +676,7 @@ export async function runBulkQueue(
             lineCount: script.lines.length,
             finishedAt: Date.now(),
           });
+          succeeded = true;
         }
       } else {
         // Standard per-chapter download path.
@@ -654,14 +704,16 @@ export async function runBulkQueue(
           stage: "done",
           finishedAt: Date.now(),
         });
+        succeeded = true;
       }
     } catch (err) {
-      onItemUpdate(i, {
-        status: "failed",
-        finishedAt: Date.now(),
-        error: err instanceof Error ? err.message : String(err),
-      });
-      // Important: don't break the loop — keep going on the next file.
+      lastErr = err;
+      console.warn(
+        `[CHAPTER ${i + 1}] attempt ${attempt + 1}/${CHAPTER_MAX_ATTEMPTS} failed:`,
+        err,
+      );
+      // Don't mark failed here — the retry loop will handle final
+      // failure marking after all attempts are exhausted.
     } finally {
       // Free this chapter's memory before the next one begins.
       // Catching here so a revoke failure can't strand the queue.
@@ -678,6 +730,17 @@ export async function runBulkQueue(
         /* ignore */
       }
     }
+
+      if (succeeded) return;
+    } // end retry loop
+
+    // All attempts exhausted — mark chapter failed.
+    onItemUpdate(i, {
+      status: "failed",
+      finishedAt: Date.now(),
+      error:
+        lastErr instanceof Error ? lastErr.message : String(lastErr ?? "unknown"),
+    });
   };
 
   // ---- Worker pool launch -----------------------------------------
@@ -788,6 +851,63 @@ export async function runBulkQueue(
   }
 
   if (longFormRecap && orderedEntries.length > 0 && !abortSignal.aborted) {
+    if (appendToSeriesId) {
+      // ---- Series-append mode ------------------------------------
+      // Don't build a combined ZIP for this batch alone. Instead push
+      // the chapters into the named series so a later "Finalize"
+      // click can produce the mega-ZIP across ALL accumulated batches
+      // (today's 10 + last week's 10 + …). The master bible also
+      // gets merged into the series so character continuity carries
+      // forward across batches.
+      onProgress({
+        itemIndex: -1,
+        stage: "combining",
+        current: 0,
+        total: 1,
+        message: `Appending ${orderedEntries.length} chapter${
+          orderedEntries.length === 1 ? "" : "s"
+        } to series…`,
+      });
+      try {
+        const result = await appendChaptersToSeries(
+          appendToSeriesId,
+          orderedEntries,
+        );
+        // Persist the latest master bible onto the series so the next
+        // batch starts with the accumulated character map intact.
+        await updateSeries(appendToSeriesId, { masterBible });
+        const series = await loadSeries(appendToSeriesId);
+        const title = series?.title ?? "series";
+        onProgress({
+          itemIndex: -1,
+          stage: "done",
+          current: 1,
+          total: 1,
+          message:
+            `Added ${result.addedCount} chapter${result.addedCount === 1 ? "" : "s"} to "${title}". ` +
+            `Series now has ${result.newTotal} chapter${result.newTotal === 1 ? "" : "s"} — click Finalize when done.`,
+        });
+        // Session cleanup — this run is complete from the bulkQueue's
+        // perspective even though the series isn't finalized yet.
+        deleteSession(sessionId).catch((err) =>
+          console.warn("Session cleanup failed:", err),
+        );
+      } catch (err) {
+        console.error("Series append failed:", err);
+        onProgress({
+          itemIndex: -1,
+          stage: "done",
+          current: 0,
+          total: 1,
+          message: `Series append failed: ${err instanceof Error ? err.message : String(err)}`,
+        });
+        throw err;
+      } finally {
+        accumulated.length = 0;
+      }
+      return;
+    }
+
     onProgress({
       itemIndex: -1,
       stage: "combining",

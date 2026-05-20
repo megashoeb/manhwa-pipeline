@@ -33,6 +33,16 @@ import {
   loadCheckpoints,
   type SessionMeta,
 } from "../core/sessionStore";
+import {
+  createSeries,
+  deleteSeries,
+  listActiveSeries,
+  loadSeriesChapters,
+  markSeriesFinalized,
+  type Series,
+} from "../core/seriesStore";
+import { generateSeriesEnding } from "../core/endingGenerator";
+import { downloadCombinedRecap } from "../core/combinedDownload";
 
 import {
   DEFAULT_FILTER_SETTINGS,
@@ -162,6 +172,195 @@ export function BulkMode({ rotator }: Props) {
     },
     [],
   );
+
+  // ---- Series mode -----------------------------------------------
+  // Persistent multi-batch projects: user uploads 10 chapters today,
+  // 10 tomorrow, etc., all appended to the same series. When done,
+  // they hit "Finalize" — pipeline generates an AI outro and builds
+  // a mega-ZIP across every batch.
+  const [activeSeriesList, setActiveSeriesList] = useState<Series[]>([]);
+  const [selectedSeriesId, setSelectedSeriesId] = useState<string>("");
+  const [addToSeries, setAddToSeries] = useState(false);
+  const [finalizing, setFinalizing] = useState(false);
+  const [seriesStatus, setSeriesStatus] = useState<string>("");
+
+  const refreshSeries = useCallback(async () => {
+    try {
+      const list = await listActiveSeries();
+      setActiveSeriesList(list);
+      // Preserve current selection if it's still active; otherwise
+      // pick the newest series so the dropdown isn't empty.
+      setSelectedSeriesId((prev) => {
+        if (prev && list.some((s) => s.id === prev)) return prev;
+        return list[0]?.id ?? "";
+      });
+    } catch (err) {
+      console.warn("Failed to load active series:", err);
+    }
+  }, []);
+
+  useEffect(() => {
+    refreshSeries();
+  }, [refreshSeries]);
+
+  const activeSeries = useMemo(
+    () => activeSeriesList.find((s) => s.id === selectedSeriesId) ?? null,
+    [activeSeriesList, selectedSeriesId],
+  );
+
+  const createNewSeries = useCallback(async () => {
+    const title = window.prompt(
+      "Series name (e.g. 'Solo Leveling', 'Tower of God'):",
+      "",
+    );
+    if (!title || !title.trim()) return;
+    try {
+      const s = await createSeries(title);
+      await refreshSeries();
+      setSelectedSeriesId(s.id);
+      setAddToSeries(true);
+    } catch (err) {
+      window.alert(
+        `Failed to create series: ${err instanceof Error ? err.message : String(err)}`,
+      );
+    }
+  }, [refreshSeries]);
+
+  const discardSeries = useCallback(
+    async (seriesId: string) => {
+      const s = activeSeriesList.find((x) => x.id === seriesId);
+      const label = s ? `"${s.title}" (${s.chapterCount} chapters)` : "this series";
+      if (
+        !window.confirm(
+          `Delete ${label}? All accumulated chapter data will be lost. Cannot be undone.`,
+        )
+      )
+        return;
+      await deleteSeries(seriesId).catch(() => {});
+      await refreshSeries();
+    },
+    [activeSeriesList, refreshSeries],
+  );
+
+  /**
+   * Finalize the active series: generate AI outro, then build the
+   * mega-ZIP across ALL accumulated batches. Marks the series as
+   * finalized in IDB so it disappears from the active selector.
+   */
+  const finalizeSeries = useCallback(async () => {
+    if (!activeSeries) return;
+    if (
+      !window.confirm(
+        `Finalize "${activeSeries.title}" (${activeSeries.chapterCount} chapters)?\n\n` +
+          "An AI-generated outro paragraph will be added and the final mega-ZIP " +
+          "will download. After this the series cannot be added to.",
+      )
+    )
+      return;
+
+    setFinalizing(true);
+    setSeriesStatus("Loading all accumulated chapters…");
+    try {
+      const chapters = await loadSeriesChapters(activeSeries.id);
+      if (chapters.length === 0) {
+        window.alert("This series has no chapters yet — process some first.");
+        setFinalizing(false);
+        return;
+      }
+
+      setSeriesStatus(
+        `Generating outro for ${chapters.length} chapters via Gemini…`,
+      );
+      // Pull the trailing beats of the LAST chapter as context for the outro.
+      const lastChapter = chapters[chapters.length - 1];
+      const tailLines = lastChapter.script.lines.slice(-6);
+      const ending = await generateSeriesEnding({
+        seriesTitle: activeSeries.title,
+        tailLines,
+        chapterCount: chapters.length,
+        rotator,
+        onKeyUsed: (m) => setCurrentKey(m),
+      });
+
+      // Append ending as a synthetic final beat tied to the last chapter's
+      // last image (preserves 1:1 image↔beat invariant in the master ZIP).
+      const lastBlobs = lastChapter.blobs;
+      const tailImage = lastBlobs[lastBlobs.length - 1];
+      const endingEntry = {
+        chapterIndex: chapters.length + 1,
+        chapterName: `Ending — ${activeSeries.title}`,
+        blobs: tailImage ? [tailImage] : [],
+        script: {
+          // ScriptResult shape — only ``lines`` is read by combinedDownload,
+          // everything else is contextual. Cast to bypass strict shape check.
+          lines: [ending],
+          scriptText: ending,
+          bible: { characters: {} },
+          scenes: [
+            {
+              panelIndices: [],
+              lines: [ending],
+            },
+          ],
+          titlePageIndices: [],
+          // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        } as any,
+      };
+
+      const finalEntries = tailImage ? [...chapters, endingEntry] : chapters;
+
+      setSeriesStatus("Building mega-ZIP — this can take a minute…");
+      const safeTitle = activeSeries.title
+        .replace(/[^a-zA-Z0-9 _-]+/g, "")
+        .replace(/\s+/g, "_")
+        .slice(0, 40)
+        || "series";
+      await downloadCombinedRecap(finalEntries, {
+        outputName: `${safeTitle}_FINAL_${chapters.length}ch_${Date.now()}`,
+        onProgress: (c, t, msg) => setSeriesStatus(`${msg} (${c}/${t})`),
+        onArchiveReady: (blob, filename) => {
+          setLastZip({
+            blob,
+            filename,
+            chapters: chapters.length,
+            at: Date.now(),
+          });
+        },
+      });
+      await markSeriesFinalized(activeSeries.id);
+      await refreshSeries();
+      setSeriesStatus(`Finalized — ${chapters.length} chapters + outro saved.`);
+    } catch (err) {
+      console.error("Finalize failed:", err);
+      setSeriesStatus(
+        `Finalize failed: ${err instanceof Error ? err.message : String(err)}`,
+      );
+    } finally {
+      setFinalizing(false);
+    }
+  }, [activeSeries, rotator, refreshSeries]);
+
+  // ---- Retry failed only ----------------------------------------
+  // After a run completes, the user can click "Retry failed" to
+  // re-process JUST the chapters that ended with status === "failed",
+  // without re-doing the ones that succeeded. Implemented as a
+  // partial re-run that flips failed rows back to pending + calls
+  // start() — the existing skip-checkpointed logic in bulkQueue will
+  // bypass the done ones.
+  const retryFailed = useCallback(async () => {
+    if (busy) return;
+    const failedCount = items.filter((it) => it.status === "failed").length;
+    if (failedCount === 0) return;
+    setItems((prev) =>
+      prev.map((it) =>
+        it.status === "failed"
+          ? { file: it.file, status: "pending" as const }
+          : it,
+      ),
+    );
+    // Defer start() to next tick so setItems flushes first.
+    window.setTimeout(() => start(), 0);
+  }, [busy, items]);  // eslint-disable-line react-hooks/exhaustive-deps
 
   // Re-render whenever the rotator state changes (usage, keys added).
   const [, forceRender] = useState(0);
@@ -294,6 +493,13 @@ export function BulkMode({ rotator }: Props) {
       longFormRecap,
       concurrency,
       sessionId: resumeSessionId,
+      // Series mode: append-to-series instead of building per-batch
+      // ZIP, but only when long-form mode is on (regular per-chapter
+      // mode doesn't accumulate into a combined output anyway).
+      appendToSeriesId:
+        longFormRecap && addToSeries && selectedSeriesId
+          ? selectedSeriesId
+          : undefined,
       onItemUpdate: (queueIdx, patch) => {
         const realIdx = indexMap.get(queueFiles[queueIdx]);
         if (realIdx == null) return;
@@ -363,7 +569,20 @@ export function BulkMode({ rotator }: Props) {
         setActiveSessions(enriched);
       })
       .catch(() => {});
-  }, [busy, items, hasAnyKey, rotator, settings, longFormRecap, parallelChapters]);
+    // Series mode: refresh the series chapter-count after append.
+    refreshSeries().catch(() => {});
+  }, [
+    busy,
+    items,
+    hasAnyKey,
+    rotator,
+    settings,
+    longFormRecap,
+    parallelChapters,
+    addToSeries,
+    selectedSeriesId,
+    refreshSeries,
+  ]);
 
   function cancel() {
     abortRef.current?.abort();
@@ -396,6 +615,24 @@ export function BulkMode({ rotator }: Props) {
           onDiscard={discardSession}
         />
       )}
+
+      {/* Series panel — multi-batch project accumulation. Lets the
+          user process 50-chapter projects across multiple days
+          (e.g. 10 chapters / day for a week) into a single mega-ZIP. */}
+      <SeriesPanel
+        seriesList={activeSeriesList}
+        selectedSeriesId={selectedSeriesId}
+        onSelect={setSelectedSeriesId}
+        addToSeries={addToSeries}
+        onToggleAdd={setAddToSeries}
+        onCreateNew={createNewSeries}
+        onDiscard={discardSeries}
+        onFinalize={finalizeSeries}
+        busy={busy}
+        finalizing={finalizing}
+        finalizingStatus={seriesStatus}
+        longFormRecap={longFormRecap}
+      />
 
       {/* Step 1 — drop PDFs */}
       <Section title="Step 1 — Drop chapter PDFs (multiple)">
@@ -587,6 +824,26 @@ export function BulkMode({ rotator }: Props) {
           {crossProgress && busy && (
             <ProgressLine progress={crossProgress} fileName={undefined} />
           )}
+          {/* Retry-failed-only button — appears after a run completes
+              if any chapter ended in "failed". Re-runs JUST the failed
+              files; already-done chapters are skipped via checkpoint. */}
+          {!busy && stats.failed > 0 && (
+            <div className="mt-3 flex items-center justify-between rounded border border-amber-700/40 bg-amber-950/30 px-3 py-2">
+              <div className="text-xs text-amber-200">
+                <span className="font-semibold">{stats.failed}</span> chapter
+                {stats.failed === 1 ? "" : "s"} failed after auto-retry. Click
+                to re-process just the failed ones.
+              </div>
+              <button
+                type="button"
+                onClick={retryFailed}
+                disabled={!hasAnyKey}
+                className="rounded bg-amber-600 px-3 py-1 text-xs font-semibold text-white hover:bg-amber-500 disabled:cursor-not-allowed disabled:opacity-50"
+              >
+                Retry {stats.failed} failed
+              </button>
+            </div>
+          )}
           {/* Re-download button — shows when a combined ZIP is in
               memory. Lets the user trigger another download without
               re-running the queue (useful if the auto-download was
@@ -728,6 +985,180 @@ function ResumeBanner({
           );
         })}
       </div>
+    </div>
+  );
+}
+
+/**
+ * Series mode panel — multi-batch project accumulation.
+ *
+ * Workflow the panel supports:
+ *   1. User clicks "New series" → enters a title (e.g. "Solo Leveling").
+ *   2. They check "Add to series" → next bulk run appends to that
+ *      series instead of building a per-batch combined ZIP.
+ *   3. They can come back the next day, upload more chapters, leave
+ *      "Add to series" on → those chapters get appended too.
+ *   4. When done across all batches, click "Finalize" → pipeline
+ *      generates an AI outro and the mega-ZIP downloads.
+ *
+ * Only meaningful in long-form recap mode (regular per-chapter mode
+ * doesn't accumulate). The panel shows a hint when long-form is off.
+ */
+function SeriesPanel({
+  seriesList,
+  selectedSeriesId,
+  onSelect,
+  addToSeries,
+  onToggleAdd,
+  onCreateNew,
+  onDiscard,
+  onFinalize,
+  busy,
+  finalizing,
+  finalizingStatus,
+  longFormRecap,
+}: {
+  seriesList: Series[];
+  selectedSeriesId: string;
+  onSelect: (id: string) => void;
+  addToSeries: boolean;
+  onToggleAdd: (v: boolean) => void;
+  onCreateNew: () => void;
+  onDiscard: (id: string) => void;
+  onFinalize: () => void;
+  busy: boolean;
+  finalizing: boolean;
+  finalizingStatus: string;
+  longFormRecap: boolean;
+}) {
+  const active = seriesList.find((s) => s.id === selectedSeriesId);
+  const hasSeries = seriesList.length > 0;
+  const canAdd = longFormRecap && hasSeries && !busy;
+  const canFinalize =
+    longFormRecap && active && active.chapterCount > 0 && !busy && !finalizing;
+
+  return (
+    <div className="rounded-lg border border-indigo-700/40 bg-indigo-950/20 p-4">
+      <div className="mb-2 flex items-center justify-between gap-2">
+        <div className="flex items-center gap-2">
+          <BookOpen className="h-4 w-4 text-indigo-300" />
+          <span className="text-sm font-semibold text-indigo-200">
+            Series mode
+          </span>
+          <span className="rounded bg-indigo-900/60 px-1.5 py-0.5 text-[10px] uppercase tracking-wide text-indigo-300">
+            multi-batch
+          </span>
+        </div>
+        <button
+          type="button"
+          onClick={onCreateNew}
+          disabled={busy}
+          className="rounded bg-indigo-600 px-2.5 py-1 text-xs font-semibold text-white hover:bg-indigo-500 disabled:cursor-not-allowed disabled:opacity-50"
+        >
+          + New series
+        </button>
+      </div>
+
+      <p className="mb-3 text-[12px] leading-relaxed text-indigo-200/70">
+        Process big projects (30-100 chapters) across multiple days. Each batch
+        appends to the active series; click <strong>Finalize</strong> when done
+        for the master ZIP with AI-generated outro.
+      </p>
+
+      {!longFormRecap && hasSeries && (
+        <div className="mb-3 rounded border border-zinc-700/60 bg-zinc-900/40 px-2 py-1.5 text-[11px] text-zinc-400">
+          Series mode requires <strong>Long-form recap</strong> to be enabled
+          below.
+        </div>
+      )}
+
+      {hasSeries ? (
+        <div className="space-y-2">
+          <div className="flex items-center gap-2">
+            <label className="text-xs text-indigo-200/80">Active series:</label>
+            <select
+              value={selectedSeriesId}
+              onChange={(e) => onSelect(e.target.value)}
+              disabled={busy}
+              className="flex-1 rounded border border-zinc-700 bg-zinc-950 px-2 py-1 text-sm text-zinc-200 focus:border-indigo-500 focus:outline-none disabled:cursor-not-allowed disabled:opacity-50"
+            >
+              {seriesList.map((s) => (
+                <option key={s.id} value={s.id}>
+                  {s.title} — {s.chapterCount} chapter
+                  {s.chapterCount === 1 ? "" : "s"}
+                </option>
+              ))}
+            </select>
+            {active && (
+              <button
+                type="button"
+                onClick={() => onDiscard(active.id)}
+                disabled={busy}
+                className="flex items-center gap-1 rounded border border-zinc-700 px-2 py-1 text-[11px] text-zinc-400 hover:border-red-500/60 hover:text-red-400 disabled:cursor-not-allowed disabled:opacity-40"
+                title="Delete this series + all accumulated chapters"
+              >
+                <Trash2 className="h-3 w-3" />
+              </button>
+            )}
+          </div>
+
+          <label
+            className={clsx(
+              "flex items-center gap-2 text-xs",
+              canAdd
+                ? "cursor-pointer text-indigo-200"
+                : "cursor-not-allowed text-zinc-500",
+            )}
+          >
+            <input
+              type="checkbox"
+              checked={addToSeries && canAdd}
+              disabled={!canAdd}
+              onChange={(e) => onToggleAdd(e.target.checked)}
+              className="h-3.5 w-3.5 accent-indigo-500"
+            />
+            Append next bulk run to{" "}
+            <strong className="text-indigo-100">{active?.title}</strong>{" "}
+            (instead of downloading a separate ZIP)
+          </label>
+
+          <div className="flex flex-wrap items-center gap-2 pt-1">
+            <button
+              type="button"
+              onClick={onFinalize}
+              disabled={!canFinalize}
+              className="flex items-center gap-1 rounded bg-emerald-600 px-3 py-1.5 text-xs font-semibold text-white hover:bg-emerald-500 disabled:cursor-not-allowed disabled:bg-zinc-700 disabled:text-zinc-400"
+              title={
+                canFinalize
+                  ? "Generate AI outro + build mega-ZIP of all accumulated chapters"
+                  : active && active.chapterCount === 0
+                    ? "Add some chapters first"
+                    : "Disabled while busy"
+              }
+            >
+              <CheckCircle2 className="h-3.5 w-3.5" />
+              Finalize {active?.title ?? "series"} (
+              {active?.chapterCount ?? 0} ch + outro)
+            </button>
+            {finalizing && (
+              <span className="flex items-center gap-1 text-[11px] text-indigo-200">
+                <Loader2 className="h-3 w-3 animate-spin" />
+                {finalizingStatus || "Finalizing…"}
+              </span>
+            )}
+            {!finalizing && finalizingStatus && (
+              <span className="text-[11px] text-indigo-200/70">
+                {finalizingStatus}
+              </span>
+            )}
+          </div>
+        </div>
+      ) : (
+        <div className="rounded border border-dashed border-indigo-700/40 bg-indigo-950/30 px-3 py-3 text-center text-xs text-indigo-200/70">
+          No active series yet — click <strong>+ New series</strong> to start
+          one.
+        </div>
+      )}
     </div>
   );
 }

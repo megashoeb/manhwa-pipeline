@@ -29,9 +29,15 @@
 import type { CombinedChapterEntry } from "./combinedDownload";
 
 const DB_NAME = "manhwa-pipeline";
-const DB_VERSION = 1;
+// v2 added the series stores (managed by seriesStore.ts). Both modules
+// share this DB, so the upgrade handler here creates ALL stores —
+// sessionStore's two AND seriesStore's two — so whichever module opens
+// the DB first sets up the full schema.
+const DB_VERSION = 2;
 const STORE_SESSIONS = "sessions";
 const STORE_CHECKPOINTS = "checkpoints";
+const STORE_SERIES = "series";
+const STORE_SERIES_CHAPTERS = "seriesChapters";
 
 // ---------------------------------------------------------------------
 // Desktop disk backup (Level 3 redundancy)
@@ -133,6 +139,7 @@ function openDb(): Promise<IDBDatabase> {
     const req = indexedDB.open(DB_NAME, DB_VERSION);
     req.onupgradeneeded = () => {
       const db = req.result;
+      // v1 stores — session checkpoints (power-cut recovery)
       if (!db.objectStoreNames.contains(STORE_SESSIONS)) {
         db.createObjectStore(STORE_SESSIONS, { keyPath: "id" });
       }
@@ -141,6 +148,16 @@ function openDb(): Promise<IDBDatabase> {
           keyPath: ["sessionId", "chapterIndex"],
         });
         cps.createIndex("bySession", "sessionId", { unique: false });
+      }
+      // v2 stores — series feature (multi-batch project accumulation)
+      if (!db.objectStoreNames.contains(STORE_SERIES)) {
+        db.createObjectStore(STORE_SERIES, { keyPath: "id" });
+      }
+      if (!db.objectStoreNames.contains(STORE_SERIES_CHAPTERS)) {
+        const sc = db.createObjectStore(STORE_SERIES_CHAPTERS, {
+          keyPath: ["seriesId", "chapterNumber"],
+        });
+        sc.createIndex("bySeries", "seriesId", { unique: false });
       }
     };
     req.onsuccess = () => resolve(req.result);
