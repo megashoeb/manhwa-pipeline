@@ -258,14 +258,33 @@ export function BulkMode({ rotator }: Props) {
     const indexMap = new Map<File, number>();
     items.forEach((it, idx) => indexMap.set(it.file, idx));
 
-    // Parallel mode resolves to "N chapters in flight at once" where N
-    // is the number of enabled API keys. With concurrency undefined,
-    // bulkQueue defaults to 1 (sequential, spec-compliant).
+    // Parallel mode resolves to "N chapters in flight at once".
+    // • With a PAID key: cap at PAID_MAX_CONCURRENCY (10) — paid Tier 1
+    //   easily handles this and a single key unlocks full parallelism
+    //   without juggling 10 free Google accounts. This was the user's
+    //   exact ask: "ek paid key se max parallel chala do".
+    // • Free-only: N = number of enabled free keys (1 RPM-bucket per
+    //   key keeps throttle contention low).
+    // • concurrency undefined → bulkQueue defaults to 1 (sequential).
+    const PAID_MAX_CONCURRENCY = 10;
     const enabledKeyCount = rotator
       .list()
       .filter((k) => k.enabled && k.value.trim()).length;
-    const concurrency =
-      parallelChapters && enabledKeyCount > 1 ? enabledKeyCount : undefined;
+    const hasPaid = rotator.hasPaidKey();
+    let concurrency: number | undefined;
+    if (parallelChapters) {
+      if (hasPaid) {
+        // One paid key is enough to unlock high parallelism. If the user
+        // also added some free keys we still cap at PAID_MAX_CONCURRENCY
+        // because going beyond that hits diminishing returns.
+        concurrency = Math.min(
+          PAID_MAX_CONCURRENCY,
+          Math.max(enabledKeyCount, PAID_MAX_CONCURRENCY),
+        );
+      } else if (enabledKeyCount > 1) {
+        concurrency = enabledKeyCount;
+      }
+    }
 
     await runBulkQueue({
       files: queueFiles,
@@ -470,6 +489,7 @@ export function BulkMode({ rotator }: Props) {
               enabledKeyCount={rotator
                 .list()
                 .filter((k) => k.enabled && k.value.trim()).length}
+              hasPaidKey={rotator.hasPaidKey()}
               chapterCount={items.length}
             />
           </div>
@@ -785,22 +805,31 @@ function ParallelToggle({
   onChange,
   busy,
   enabledKeyCount,
+  hasPaidKey,
   chapterCount,
 }: {
   value: boolean;
   onChange: (v: boolean) => void;
   busy: boolean;
   enabledKeyCount: number;
+  hasPaidKey: boolean;
   chapterCount: number;
 }) {
-  // Speedup math — assumes ~10 min per chapter sequential. With N
-  // parallel workers (N = enabled keys), total = ceil(chapters/N) ×
-  // ~10 min. Capped at chapter count for tiny runs.
-  const effectiveWorkers = Math.max(1, Math.min(enabledKeyCount, chapterCount));
+  // Speedup math — assumes ~10 min per chapter sequential.
+  // Free-only: N parallel workers = N enabled keys.
+  // Paid mode: unlocks up to 10 concurrent regardless of key count
+  // (single paid key handles 1000+ RPM, way more than we'll ever push).
+  const PAID_MAX_CONCURRENCY = 10;
+  const workerCap = hasPaidKey
+    ? Math.max(PAID_MAX_CONCURRENCY, enabledKeyCount)
+    : enabledKeyCount;
+  const effectiveWorkers = Math.max(1, Math.min(workerCap, chapterCount));
   const sequentialMin = chapterCount * 10;
   const parallelMin = Math.ceil(chapterCount / effectiveWorkers) * 10;
   const savedMin = sequentialMin - parallelMin;
-  const canEnable = enabledKeyCount >= 2;
+  // With a paid key, even 1 enabled key is enough to enable parallel.
+  // Without paid, need 2+ free keys to make parallel meaningful.
+  const canEnable = hasPaidKey || enabledKeyCount >= 2;
 
   return (
     <div
@@ -835,14 +864,22 @@ function ParallelToggle({
                 {effectiveWorkers}× faster
               </span>
             )}
+            {hasPaidKey && (
+              <span className="rounded bg-amber-900/60 px-1.5 py-0.5 text-[10px] uppercase tracking-wide text-amber-300">
+                paid mode
+              </span>
+            )}
             {!canEnable && (
               <span className="rounded bg-zinc-800 px-1.5 py-0.5 text-[10px] uppercase tracking-wide text-zinc-500">
-                needs 2+ keys
+                needs 2+ keys (or 1 paid)
               </span>
             )}
           </div>
           <div className="mt-1 text-[12px] leading-relaxed text-zinc-400">
-            Run up to <strong className="text-zinc-200">{effectiveWorkers}</strong> chapters at once (one per enabled key).
+            Run up to <strong className="text-zinc-200">{effectiveWorkers}</strong> chapters at once
+            {hasPaidKey
+              ? " (paid key unlocks high concurrency — no rate-limit pauses)."
+              : " (one per enabled key)."}{" "}
             Speedup is roughly {effectiveWorkers}× on large runs.
           </div>
           {value && canEnable && chapterCount > 1 && (

@@ -102,6 +102,17 @@ export interface ApiKey {
   label: string;
   /** Disable a key without deleting it (useful when troubleshooting quotas). */
   enabled: boolean;
+  /**
+   * "free" (default) — enforce the 15 RPM / 500 RPD free-tier caps.
+   * "paid" — billing-enabled key; rotator does NOT throttle on RPM or
+   * RPD because paid Tier 1 starts at ~1000 RPM with no daily cap. A
+   * single paid key unlocks high-concurrency mode (up to PAID_MAX_CONCURRENCY
+   * parallel chapters) in bulkQueue, turning 4-hour 50-chapter runs
+   * into ~30-minute runs.
+   *
+   * Omitted on legacy ApiKey records — treated as "free" for backward compat.
+   */
+  tier?: "free" | "paid";
 }
 
 /** Per-key runtime usage tracking. Persisted in localStorage and reset daily. */

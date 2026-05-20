@@ -109,8 +109,10 @@ export class KeyRotator {
   // ---- rotation ----------------------------------------------------
 
   /**
-   * Pick the next key to use. Waits (sleeps) when every key is RPM-
-   * throttled. Throws when every key has hit its daily limit.
+   * Pick the next key to use. Waits (sleeps) when every FREE key is
+   * RPM-throttled. Paid keys never throttle (Gemini paid Tier 1 starts
+   * at ~1000 RPM with no daily cap — irrelevant for our use). Throws
+   * only when every key (free + paid) is unusable.
    */
   async pick(): Promise<string> {
     this.resetIfNewDay();
@@ -122,14 +124,26 @@ export class KeyRotator {
       );
     }
 
-    // Filter out keys that have hit the daily cap.
+    // Paid keys: bypass RPM/RPD entirely. We still track usage so the
+    // user can see stats, but a paid key is always immediately
+    // returnable. Prefer the least-used paid key so usage spreads
+    // across multiple paid keys if the user has more than one.
+    const paid = enabled.filter((k) => k.tier === "paid");
+    if (paid.length > 0) {
+      const sortedPaid = [...paid].sort(
+        (a, b) => this.usage[a.value].usageDay - this.usage[b.value].usageDay,
+      );
+      return sortedPaid[0].value;
+    }
+
+    // Free keys only path. Filter out daily-capped keys.
     const underDaily = enabled.filter(
       (k) => this.usage[k.value].usageDay < this.limits.dailyLimit,
     );
     if (underDaily.length === 0) {
       throw new Error(
         `All ${enabled.length} API key(s) have hit today's ${this.limits.dailyLimit}-request limit. ` +
-          "Add more keys or wait until tomorrow.",
+          "Add more keys, enable a paid-tier key, or wait until tomorrow.",
       );
     }
 
@@ -158,6 +172,20 @@ export class KeyRotator {
     await sleep(Math.max(250, minWait + 100));
     // After waiting, recurse — at least one key should now be available.
     return this.pick();
+  }
+
+  /** True when at least one enabled, working paid key exists. */
+  hasPaidKey(): boolean {
+    return this.keys.some(
+      (k) => k.enabled && k.value.trim() !== "" && k.tier === "paid",
+    );
+  }
+
+  /** Count of enabled paid keys (for concurrency calculation). */
+  countPaidKeys(): number {
+    return this.keys.filter(
+      (k) => k.enabled && k.value.trim() !== "" && k.tier === "paid",
+    ).length;
   }
 
   /** Mark a successful request against the given key. */

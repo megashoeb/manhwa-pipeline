@@ -20,6 +20,7 @@ export function ApiKeyManager({ rotator }: Props) {
   const [adding, setAdding] = useState(false);
   const [newLabel, setNewLabel] = useState("");
   const [newValue, setNewValue] = useState("");
+  const [newTier, setNewTier] = useState<"free" | "paid">("free");
   const [showFull, setShowFull] = useState<Record<string, boolean>>({});
 
   // Re-render whenever the rotator's state changes (usage tick, add, etc.).
@@ -27,20 +28,24 @@ export function ApiKeyManager({ rotator }: Props) {
 
   const keys = rotator.list();
   const limits = rotator.getLimits();
+  // "Calls remaining" only counts free-tier keys against the daily cap;
+  // paid keys don't have one and are tracked separately.
   const totalAvailable = keys
-    .filter((k) => k.enabled)
+    .filter((k) => k.enabled && k.tier !== "paid")
     .reduce(
       (sum, k) => sum + Math.max(0, limits.dailyLimit - rotator.getUsage(k.value).usageDay),
       0,
     );
+  const paidCount = keys.filter((k) => k.enabled && k.tier === "paid").length;
 
   function submit() {
     const value = newValue.trim();
     if (!value) return;
     const label = newLabel.trim() || `Key ${keys.length + 1}`;
-    rotator.add({ value, label, enabled: true });
+    rotator.add({ value, label, enabled: true, tier: newTier });
     setNewLabel("");
     setNewValue("");
+    setNewTier("free");
     setAdding(false);
   }
 
@@ -55,8 +60,17 @@ export function ApiKeyManager({ rotator }: Props) {
           </span>
           {keys.length > 0 && (
             <span className="text-xs text-zinc-500">
-              ({keys.filter((k) => k.enabled).length} active •{" "}
-              {totalAvailable.toLocaleString()} calls remaining today)
+              ({keys.filter((k) => k.enabled).length} active
+              {paidCount > 0 && (
+                <span className="ml-1 rounded bg-amber-900/60 px-1 text-[10px] font-semibold uppercase tracking-wide text-amber-300">
+                  {paidCount} paid
+                </span>
+              )}{" "}
+              •{" "}
+              {paidCount > 0
+                ? "no daily cap"
+                : `${totalAvailable.toLocaleString()} calls remaining today`}
+              )
             </span>
           )}
         </div>
@@ -129,8 +143,40 @@ export function ApiKeyManager({ rotator }: Props) {
                   )}
                 </button>
                 <div className="ml-auto flex items-center gap-3">
-                  <div className="text-xs tabular-nums text-zinc-400">
-                    {usage.usageDay}/{limits.dailyLimit}
+                  {/* Tier selector — switch a key between free and paid
+                      after creation. Paid keys bypass the rotator's
+                      RPM/RPD caps and unlock high-concurrency mode. */}
+                  <select
+                    value={k.tier ?? "free"}
+                    onChange={(e) =>
+                      rotator.update(k.value, {
+                        tier: e.target.value as "free" | "paid",
+                      })
+                    }
+                    className={clsx(
+                      "rounded border bg-zinc-950 px-1.5 py-0.5 text-[10px] font-semibold uppercase tracking-wide",
+                      k.tier === "paid"
+                        ? "border-amber-500/60 text-amber-300"
+                        : "border-zinc-700 text-zinc-400",
+                    )}
+                    title={
+                      k.tier === "paid"
+                        ? "Paid tier — RPM/RPD caps disabled, high parallelism enabled"
+                        : "Free tier — 15 RPM / 500 RPD per Google's free-tier limits"
+                    }
+                  >
+                    <option value="free">Free</option>
+                    <option value="paid">Paid</option>
+                  </select>
+                  <div
+                    className={clsx(
+                      "text-xs tabular-nums",
+                      k.tier === "paid" ? "text-amber-300/70" : "text-zinc-400",
+                    )}
+                  >
+                    {k.tier === "paid"
+                      ? `${usage.usageDay} calls today`
+                      : `${usage.usageDay}/${limits.dailyLimit}`}
                   </div>
                   <button
                     type="button"
@@ -142,19 +188,29 @@ export function ApiKeyManager({ rotator }: Props) {
                   </button>
                 </div>
               </div>
-              {/* Usage bar */}
+              {/* Usage bar — paid keys get a static amber bar (no cap
+                  to fill); free keys get the standard red/amber/green
+                  fill based on dailyPct. */}
               <div className="mt-1.5 h-1 overflow-hidden rounded bg-zinc-800">
-                <div
-                  className={clsx(
-                    "h-full transition-all duration-300",
-                    exhausted
-                      ? "bg-red-500"
-                      : dailyPct > 80
-                        ? "bg-amber-500"
-                        : "bg-emerald-500",
-                  )}
-                  style={{ width: `${dailyPct}%` }}
-                />
+                {k.tier === "paid" ? (
+                  <div
+                    className="h-full bg-gradient-to-r from-amber-500 to-amber-400"
+                    style={{ width: "100%" }}
+                    title="Paid tier — no daily cap"
+                  />
+                ) : (
+                  <div
+                    className={clsx(
+                      "h-full transition-all duration-300",
+                      exhausted
+                        ? "bg-red-500"
+                        : dailyPct > 80
+                          ? "bg-amber-500"
+                          : "bg-emerald-500",
+                    )}
+                    style={{ width: `${dailyPct}%` }}
+                  />
+                )}
               </div>
             </div>
           );
@@ -180,6 +236,29 @@ export function ApiKeyManager({ rotator }: Props) {
                 className="rounded border border-zinc-700 bg-zinc-950 px-2 py-1 font-mono text-xs text-zinc-200 placeholder-zinc-600 focus:border-zinc-500 focus:outline-none"
               />
             </div>
+            <div className="flex items-center gap-3">
+              <label className="text-xs text-zinc-400">Tier:</label>
+              <label className="flex items-center gap-1 text-xs text-zinc-300">
+                <input
+                  type="radio"
+                  name="newTier"
+                  checked={newTier === "free"}
+                  onChange={() => setNewTier("free")}
+                  className="accent-blue-500"
+                />
+                Free (15 RPM / 500 RPD cap)
+              </label>
+              <label className="flex items-center gap-1 text-xs text-amber-300">
+                <input
+                  type="radio"
+                  name="newTier"
+                  checked={newTier === "paid"}
+                  onChange={() => setNewTier("paid")}
+                  className="accent-amber-500"
+                />
+                Paid (no caps, unlocks 10× parallel)
+              </label>
+            </div>
             <div className="flex gap-2">
               <button
                 type="button"
@@ -195,6 +274,7 @@ export function ApiKeyManager({ rotator }: Props) {
                   setAdding(false);
                   setNewLabel("");
                   setNewValue("");
+                  setNewTier("free");
                 }}
                 className="rounded border border-zinc-700 px-3 py-1 text-xs text-zinc-300 hover:bg-zinc-800"
               >

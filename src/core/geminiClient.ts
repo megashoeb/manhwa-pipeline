@@ -64,6 +64,16 @@ const SERVER_ERROR_STATUSES = new Set([500, 502, 503, 504]);
 /** Total retry budget per Gemini call. */
 const MAX_ATTEMPTS = 6;
 
+/**
+ * Hard ceiling per single fetch — if Gemini hasn't responded in this
+ * many ms we abort and retry on the next attempt. Without this, a
+ * silently-stuck connection (TCP keep-alive failed, ALB issue, etc.)
+ * would freeze a worker indefinitely and block the whole bulk run.
+ * 180s is generous for normal calls (most return in 3-15s) but kills
+ * truly stuck ones.
+ */
+const REQUEST_TIMEOUT_MS = 180_000;
+
 /** Exponential backoff: 2s, 4s, 8s, 16s, 32s, 60s. */
 function backoffMs(attempt: number): number {
   return Math.min(60_000, 2_000 * 2 ** attempt);
@@ -169,6 +179,14 @@ async function callWithRetries(
     opts.onKeyUsed?.(maskKey(apiKey));
 
     let response: Response;
+    // AbortController + setTimeout guarantees a stuck fetch can't hang
+    // the worker forever. If the timeout fires we treat it as a network
+    // error and fall through to the existing retry logic.
+    const ctrl = new AbortController();
+    const timeoutHandle = window.setTimeout(
+      () => ctrl.abort(new Error(`Gemini request timed out after ${REQUEST_TIMEOUT_MS}ms`)),
+      REQUEST_TIMEOUT_MS,
+    );
     try {
       response = await fetch(
         `${ENDPOINT}/${modelId}:generateContent?key=${apiKey}`,
@@ -176,21 +194,26 @@ async function callWithRetries(
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify(body),
+          signal: ctrl.signal,
         },
       );
     } catch (e) {
-      // Network error (offline, DNS, CORS, etc.) — wait + retry.
+      // Network error OR our own timeout — same retry treatment.
       lastErr = e;
       if (attempt < MAX_ATTEMPTS - 1) {
         const delay = backoffMs(attempt);
+        const isTimeout =
+          e instanceof Error && e.name === "AbortError";
         console.warn(
-          `Gemini network error on attempt ${attempt + 1}/${MAX_ATTEMPTS} (${modelId}), ` +
-            `retrying in ${delay / 1000}s …`,
+          `Gemini ${isTimeout ? "timeout" : "network error"} on attempt ` +
+            `${attempt + 1}/${MAX_ATTEMPTS} (${modelId}), retrying in ${delay / 1000}s …`,
           e,
         );
         await sleep(delay);
       }
       continue;
+    } finally {
+      window.clearTimeout(timeoutHandle);
     }
 
     if (response.status === 429) {
