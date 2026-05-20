@@ -238,23 +238,40 @@ export function BulkMode({ rotator }: Props) {
     [activeSeriesList, selectedSeriesId],
   );
 
-  const createNewSeries = useCallback(async () => {
-    const title = window.prompt(
-      "Series name (e.g. 'Solo Leveling', 'Tower of God'):",
-      "",
-    );
-    if (!title || !title.trim()) return;
+  // New-series creation uses an inline modal (NOT window.prompt).
+  // Electron's BrowserWindow disables window.prompt for security and
+  // several browsers also block it as a popup-style call — both
+  // returned null silently, so the "+ New series" button looked
+  // broken. The modal state lives here; the modal UI is rendered
+  // near the bottom of the JSX tree.
+  const [newSeriesModalOpen, setNewSeriesModalOpen] = useState(false);
+  const [newSeriesTitleDraft, setNewSeriesTitleDraft] = useState("");
+  const [newSeriesError, setNewSeriesError] = useState("");
+
+  const openNewSeriesModal = useCallback(() => {
+    setNewSeriesTitleDraft("");
+    setNewSeriesError("");
+    setNewSeriesModalOpen(true);
+  }, []);
+
+  const submitNewSeries = useCallback(async () => {
+    const title = newSeriesTitleDraft.trim();
+    if (!title) {
+      setNewSeriesError("Please enter a series name.");
+      return;
+    }
     try {
       const s = await createSeries(title);
       await refreshSeries();
       setSelectedSeriesId(s.id);
       setAddToSeries(true);
+      setNewSeriesModalOpen(false);
     } catch (err) {
-      window.alert(
+      setNewSeriesError(
         `Failed to create series: ${err instanceof Error ? err.message : String(err)}`,
       );
     }
-  }, [refreshSeries]);
+  }, [newSeriesTitleDraft, refreshSeries]);
 
   const discardSeries = useCallback(
     async (seriesId: string) => {
@@ -679,6 +696,7 @@ export function BulkMode({ rotator }: Props) {
         <ResumeBanner
           sessions={activeSessions}
           matchingSessionId={matchingSession?.meta.id ?? null}
+          uploadedNames={items.map((it) => it.file.name)}
           onResume={(sessionId) => start(sessionId)}
           onDiscard={discardSession}
         />
@@ -693,7 +711,7 @@ export function BulkMode({ rotator }: Props) {
         onSelect={setSelectedSeriesId}
         addToSeries={addToSeries}
         onToggleAdd={setAddToSeries}
-        onCreateNew={createNewSeries}
+        onCreateNew={openNewSeriesModal}
         onDiscard={discardSeries}
         onFinalize={finalizeSeries}
         busy={busy}
@@ -701,6 +719,19 @@ export function BulkMode({ rotator }: Props) {
         finalizingStatus={seriesStatus}
         longFormRecap={longFormRecap}
       />
+
+      {/* New-series modal — replaces window.prompt which doesn't work
+          in Electron (security-disabled) and is blocked by some
+          browsers. Inline form is universal. */}
+      {newSeriesModalOpen && (
+        <NewSeriesModal
+          title={newSeriesTitleDraft}
+          onTitleChange={setNewSeriesTitleDraft}
+          error={newSeriesError}
+          onSubmit={submitNewSeries}
+          onCancel={() => setNewSeriesModalOpen(false)}
+        />
+      )}
 
       {/* Step 1 — drop PDFs */}
       <Section title="Step 1 — Drop chapter PDFs (multiple)">
@@ -1000,11 +1031,13 @@ export function BulkMode({ rotator }: Props) {
 function ResumeBanner({
   sessions,
   matchingSessionId,
+  uploadedNames,
   onResume,
   onDiscard,
 }: {
   sessions: Array<{ meta: SessionMeta; checkpointCount: number }>;
   matchingSessionId: string | null;
+  uploadedNames: string[];
   onResume: (sessionId: string) => void;
   onDiscard: (sessionId: string) => void;
 }) {
@@ -1037,61 +1070,100 @@ function ResumeBanner({
                 : ageMs < 86_400_000
                   ? `${Math.round(ageMs / 3_600_000)} h ago`
                   : `${Math.round(ageMs / 86_400_000)} d ago`;
+          // Show how many of the uploaded PDFs are present in this
+          // session's expected list, by name. Helps the user see
+          // exactly what they still need to upload when partial match.
+          const expectedNames = new Set(meta.pdfFingerprints.map((p) => p.name));
+          const uploadedSet = new Set(uploadedNames);
+          const matchedByName = [...expectedNames].filter((n) =>
+            uploadedSet.has(n),
+          ).length;
+          const missing = [...expectedNames].filter(
+            (n) => !uploadedSet.has(n),
+          );
           return (
             <div
               key={meta.id}
               className={clsx(
-                "flex items-center justify-between gap-3 rounded border px-3 py-2 text-xs",
+                "rounded border px-3 py-2 text-xs",
                 isMatch
                   ? "border-emerald-600/60 bg-emerald-950/30"
                   : "border-zinc-700/50 bg-zinc-900/40",
               )}
             >
-              <div className="min-w-0 flex-1">
-                <div
-                  className={clsx(
-                    "font-mono text-[11px] truncate",
-                    isMatch ? "text-emerald-200" : "text-zinc-300",
+              <div className="flex items-center justify-between gap-3">
+                <div className="min-w-0 flex-1">
+                  <div
+                    className={clsx(
+                      "font-mono text-[11px] truncate",
+                      isMatch ? "text-emerald-200" : "text-zinc-300",
+                    )}
+                  >
+                    {checkpointCount} / {meta.pdfFingerprints.length} chapters
+                    done — started {ageLabel}
+                    {meta.options.longFormRecap ? " · long-form" : ""}
+                  </div>
+                  <div className="mt-0.5 truncate text-[10px] text-zinc-500">
+                    {meta.pdfFingerprints
+                      .slice(0, 3)
+                      .map((p) => p.name)
+                      .join(", ")}
+                    {meta.pdfFingerprints.length > 3 &&
+                      ` +${meta.pdfFingerprints.length - 3} more`}{" "}
+                    · {startedAt.toLocaleString()}
+                  </div>
+                </div>
+                <div className="flex shrink-0 items-center gap-1.5">
+                  {isMatch ? (
+                    <button
+                      type="button"
+                      onClick={() => onResume(meta.id)}
+                      className="flex items-center gap-1 rounded bg-emerald-600 px-3 py-1 text-xs font-semibold text-white hover:bg-emerald-500"
+                    >
+                      <Play className="h-3 w-3" />
+                      Resume
+                    </button>
+                  ) : uploadedNames.length === 0 ? (
+                    <span
+                      className="rounded bg-zinc-800 px-2 py-1 text-[10px] text-zinc-500"
+                      title="Upload the same PDFs to enable Resume"
+                    >
+                      Upload PDFs to enable
+                    </span>
+                  ) : (
+                    <span
+                      className="rounded bg-amber-950/60 px-2 py-1 text-[10px] text-amber-300"
+                      title={
+                        missing.length > 0
+                          ? `Still missing: ${missing.slice(0, 5).join(", ")}${missing.length > 5 ? ` +${missing.length - 5} more` : ""}`
+                          : "PDF sizes don't match this session"
+                      }
+                    >
+                      {matchedByName} of {expectedNames.size} match
+                    </span>
                   )}
-                >
-                  {checkpointCount} / {meta.pdfFingerprints.length} chapters
-                  done — started {ageLabel}
-                  {meta.options.longFormRecap ? " · long-form" : ""}
-                </div>
-                <div className="mt-0.5 truncate text-[10px] text-zinc-500">
-                  {meta.pdfFingerprints
-                    .slice(0, 3)
-                    .map((p) => p.name)
-                    .join(", ")}
-                  {meta.pdfFingerprints.length > 3 &&
-                    ` +${meta.pdfFingerprints.length - 3} more`}{" "}
-                  · {startedAt.toLocaleString()}
-                </div>
-              </div>
-              <div className="flex shrink-0 items-center gap-1.5">
-                {isMatch ? (
                   <button
                     type="button"
-                    onClick={() => onResume(meta.id)}
-                    className="flex items-center gap-1 rounded bg-emerald-600 px-3 py-1 text-xs font-semibold text-white hover:bg-emerald-500"
+                    onClick={() => onDiscard(meta.id)}
+                    className="flex items-center gap-1 rounded border border-zinc-700 px-2 py-1 text-[10px] text-zinc-400 hover:border-red-500/60 hover:text-red-400"
+                    title="Delete this saved session"
                   >
-                    <Play className="h-3 w-3" />
-                    Resume
+                    <Trash2 className="h-3 w-3" />
                   </button>
-                ) : (
-                  <span className="rounded bg-zinc-800 px-2 py-1 text-[10px] text-zinc-500">
-                    Upload same PDFs
-                  </span>
-                )}
-                <button
-                  type="button"
-                  onClick={() => onDiscard(meta.id)}
-                  className="flex items-center gap-1 rounded border border-zinc-700 px-2 py-1 text-[10px] text-zinc-400 hover:border-red-500/60 hover:text-red-400"
-                  title="Delete this saved session"
-                >
-                  <Trash2 className="h-3 w-3" />
-                </button>
+                </div>
               </div>
+              {/* Hint row — show which PDFs are still missing when the
+                  user has uploaded some but not all. Hidden when match
+                  is perfect (Resume button is active) or no PDFs at all. */}
+              {!isMatch && uploadedNames.length > 0 && missing.length > 0 && (
+                <div className="mt-1.5 text-[10px] text-amber-300/70">
+                  Still need:{" "}
+                  <span className="font-mono">
+                    {missing.slice(0, 4).join(", ")}
+                    {missing.length > 4 && ` +${missing.length - 4} more`}
+                  </span>
+                </div>
+              )}
             </div>
           );
         })}
@@ -1115,6 +1187,111 @@ function ResumeBanner({
  * Only meaningful in long-form recap mode (regular per-chapter mode
  * doesn't accumulate). The panel shows a hint when long-form is off.
  */
+/**
+ * Inline modal for entering a new series title.
+ *
+ * Why not ``window.prompt``: Electron's BrowserWindow has prompt()
+ * disabled by default for security (returns null silently) and some
+ * browsers also block prompt() as an annoying popup. Both made the
+ * "+ New series" button look broken with no error. This inline modal
+ * works in all environments.
+ *
+ * Enter submits, Escape cancels, click-outside cancels. Backdrop is
+ * rendered as a portal-less fixed overlay so it doesn't depend on
+ * any layout context.
+ */
+function NewSeriesModal({
+  title,
+  onTitleChange,
+  error,
+  onSubmit,
+  onCancel,
+}: {
+  title: string;
+  onTitleChange: (v: string) => void;
+  error: string;
+  onSubmit: () => void;
+  onCancel: () => void;
+}) {
+  const inputRef = useRef<HTMLInputElement>(null);
+  useEffect(() => {
+    // Autofocus when the modal opens so the user can start typing
+    // immediately. Slight delay to wait for the element to mount.
+    const t = setTimeout(() => inputRef.current?.focus(), 0);
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape") onCancel();
+    };
+    window.addEventListener("keydown", onKey);
+    return () => {
+      clearTimeout(t);
+      window.removeEventListener("keydown", onKey);
+    };
+  }, [onCancel]);
+
+  return (
+    <div
+      className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 p-4"
+      onClick={(e) => {
+        if (e.target === e.currentTarget) onCancel();
+      }}
+    >
+      <div className="w-full max-w-md rounded-lg border border-indigo-700/60 bg-zinc-900 p-5 shadow-2xl">
+        <h3 className="mb-3 flex items-center gap-2 text-base font-semibold text-zinc-100">
+          <BookOpen className="h-4 w-4 text-indigo-400" />
+          Create a new series
+        </h3>
+        <p className="mb-3 text-[12px] leading-relaxed text-zinc-400">
+          Series accumulate chapters across multiple processing runs.
+          Give it a name (e.g. <em>Solo Leveling</em>) — you'll be able
+          to append more chapters to it later and finalize with an AI
+          outro when done.
+        </p>
+        <label className="mb-1 block text-xs font-medium text-zinc-300">
+          Series name
+        </label>
+        <input
+          ref={inputRef}
+          type="text"
+          value={title}
+          onChange={(e) => onTitleChange(e.target.value)}
+          onKeyDown={(e) => {
+            if (e.key === "Enter") {
+              e.preventDefault();
+              onSubmit();
+            }
+          }}
+          placeholder="e.g. Solo Leveling"
+          className="w-full rounded border border-zinc-700 bg-zinc-950 px-2.5 py-2 text-sm text-zinc-100 placeholder-zinc-600 focus:border-indigo-500 focus:outline-none"
+          maxLength={120}
+        />
+        {error && (
+          <div className="mt-2 rounded bg-red-950/50 px-2 py-1 text-[11px] text-red-300">
+            {error}
+          </div>
+        )}
+        <div className="mt-4 flex justify-end gap-2">
+          <button
+            type="button"
+            onClick={onCancel}
+            className="rounded border border-zinc-700 px-3 py-1.5 text-xs text-zinc-300 hover:bg-zinc-800"
+          >
+            Cancel
+          </button>
+          <button
+            type="button"
+            onClick={onSubmit}
+            disabled={!title.trim()}
+            className="flex items-center gap-1 rounded bg-indigo-600 px-3 py-1.5 text-xs font-semibold text-white hover:bg-indigo-500 disabled:cursor-not-allowed disabled:opacity-50"
+          >
+            <CheckCircle2 className="h-3.5 w-3.5" />
+            Create series
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
 function SeriesPanel({
   seriesList,
   selectedSeriesId,

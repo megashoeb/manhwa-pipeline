@@ -253,7 +253,7 @@ export async function runBulkQueue(
   // work — on restart we pre-populate ``accumulated[]`` from saved
   // checkpoints and the chapter loop simply skips them.
   const sessionId = resumedSessionId ?? newSessionId();
-  await saveSession({
+  const sessionMeta = {
     id: sessionId,
     startedAt: Date.now(),
     pdfFingerprints: files.map(fingerprintFile),
@@ -263,9 +263,31 @@ export async function runBulkQueue(
     },
     isComplete: false,
     checkpointCount: 0,
-  }).catch((err) =>
+  };
+  await saveSession(sessionMeta).catch((err) =>
     console.warn("Session save failed (continuing without checkpoints):", err),
   );
+
+  // Bumps the session metadata after each successful checkpoint so
+  // the resume banner always reflects the LATEST progress. The lock
+  // chain ensures two parallel workers don't race-overwrite each
+  // other's count.
+  let sessionMetaLock: Promise<unknown> = Promise.resolve();
+  const bumpSessionMeta = async (newCount: number): Promise<void> => {
+    await sessionMetaLock;
+    sessionMetaLock = (async () => {
+      try {
+        sessionMeta.checkpointCount = Math.max(
+          sessionMeta.checkpointCount,
+          newCount,
+        );
+        await saveSession({ ...sessionMeta });
+      } catch (err) {
+        console.warn("Session metadata bump failed:", err);
+      }
+    })();
+    await sessionMetaLock;
+  };
 
   // SLOT-INDEXED accumulator preserves chapter ORDER regardless of
   // which worker finishes first in parallel mode. ``accumulated[i]``
@@ -752,6 +774,13 @@ export async function runBulkQueue(
               err,
             ),
           );
+          // ALSO bump the session metadata's checkpointCount + bumps
+          // updatedAt so the resume banner shows accurate progress even
+          // when listing without loading each chapter checkpoint.
+          const completedSoFar = accumulated.filter(
+            (e) => e !== undefined,
+          ).length;
+          bumpSessionMeta(completedSoFar).catch(() => {});
           onItemUpdate(i, {
             status: "done",
             stage: "done",

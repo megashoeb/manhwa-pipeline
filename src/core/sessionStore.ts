@@ -188,20 +188,34 @@ export function fingerprintFile(file: File): PdfFingerprint {
   };
 }
 
-/** Same length AND each fingerprint matches in the same order. */
+/**
+ * Same length AND each PDF matches by NAME + SIZE (order-independent).
+ *
+ * ``lastModified`` is intentionally NOT part of the match: the OS
+ * updates it whenever the user copies the file to a new folder, opens
+ * it in a PDF viewer, or syncs through cloud storage. Without this
+ * relaxation the resume banner silently failed when the user dragged
+ * the same PDFs in from a different location than the original run.
+ *
+ * Name + size collisions are theoretically possible but in practice
+ * vanishingly rare for chapter PDFs (different sizes when the page
+ * count differs, even by one panel). The cost of a false-positive
+ * match would be the user choosing the wrong saved session to resume,
+ * which the resume UI lets them undo easily.
+ */
 export function fingerprintsMatch(
   a: PdfFingerprint[],
   b: PdfFingerprint[],
 ): boolean {
   if (a.length !== b.length) return false;
-  for (let i = 0; i < a.length; i++) {
-    if (
-      a[i].name !== b[i].name ||
-      a[i].size !== b[i].size ||
-      a[i].lastModified !== b[i].lastModified
-    ) {
-      return false;
-    }
+  // Build size-by-name maps to support uploads in a different order
+  // than the original run (e.g. user drags multiple PDFs from
+  // Explorer and the OS hands them over re-sorted).
+  const mapA = new Map<string, number>();
+  for (const p of a) mapA.set(p.name, p.size);
+  for (const p of b) {
+    const expected = mapA.get(p.name);
+    if (expected == null || expected !== p.size) return false;
   }
   return true;
 }
