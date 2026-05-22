@@ -210,7 +210,11 @@ export async function pollTaskUntilDone(
   opts: PollOptions = {},
 ): Promise<TaskResponse> {
   const interval = opts.intervalMs ?? 2000;
-  const timeout = opts.timeoutMs ?? 5 * 60 * 1000;
+  // 15 min default — ai33.pro aggregator can be slow at peak times,
+  // especially with eleven_multilingual_v2. 5 min was too tight; we
+  // were aborting polls on tasks that completed seconds later, wasting
+  // credits.
+  const timeout = opts.timeoutMs ?? 15 * 60 * 1000;
   const started = Date.now();
 
   while (Date.now() - started < timeout) {
@@ -227,22 +231,50 @@ export async function pollTaskUntilDone(
     }
     await new Promise((r) => setTimeout(r, interval));
   }
+
+  // Final check before giving up — the task may have completed in the
+  // last poll interval. Without this, we'd burn the credit even though
+  // the audio is sitting ready server-side.
+  try {
+    const final = await getTask(config, taskId);
+    opts.onPoll?.(final);
+    if (final.status === "done") return final;
+    if (final.status === "failed") {
+      throw new Error(
+        final.error_message ?? `Task ${taskId} failed with no error message`,
+      );
+    }
+  } catch (err) {
+    // If the task definitively failed, surface that. Otherwise fall
+    // through to the timeout error below.
+    if (err instanceof Error && /failed/i.test(err.message)) throw err;
+  }
+
   throw new Error(
     `Task ${taskId} did not complete within ${Math.round(timeout / 1000)}s — aborting poll`,
   );
 }
 
-/** Convenience: do POST + poll in one call. */
+/**
+ * Convenience: do POST + poll in one call. Exposes ``onTaskCreated``
+ * so callers can persist the task_id BEFORE polling begins — that way
+ * if the user closes the tab mid-poll, we can recover the audio later
+ * via ``getTask`` instead of burning a fresh credit.
+ */
 export async function generateSpeech(
   config: VoiceApiConfig,
   opts: TtsCreateOptions & {
+    onTaskCreated?: (taskId: string) => void;
     onPoll?: (task: TaskResponse) => void;
     signal?: AbortSignal;
+    timeoutMs?: number;
   },
 ): Promise<TaskResponse> {
   const taskId = await createSpeechTask(config, opts);
+  opts.onTaskCreated?.(taskId);
   return pollTaskUntilDone(config, taskId, {
     onPoll: opts.onPoll,
     signal: opts.signal,
+    timeoutMs: opts.timeoutMs,
   });
 }

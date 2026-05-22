@@ -26,6 +26,7 @@ import {
   Mic,
   Play,
   RefreshCw,
+  RotateCcw,
   Search,
   Square,
   Star,
@@ -35,9 +36,11 @@ import clsx from "clsx";
 
 import {
   generateSpeech,
+  getTask,
   getVoice,
   listVoices,
   type Voice,
+  type VoiceApiConfig,
 } from "../core/voiceApi";
 import {
   fetchDecodeStitch,
@@ -49,8 +52,20 @@ import { readJson, writeJson } from "../core/storage";
 const STORAGE_KEY_API = "manhwa.tts.apiKey";
 const STORAGE_KEY_FORM = "manhwa.tts.lastForm";
 const STORAGE_KEY_FAVS = "manhwa.tts.favourites";
+// Per-line task cache — keyed by (voice + model + text fingerprint).
+// Lets us (a) skip API calls on re-runs of the same script,
+// (b) recover task_ids after a crash without burning fresh credits.
+const STORAGE_KEY_CACHE = "manhwa.tts.lineCache";
 
-const DEFAULT_MODEL = "eleven_multilingual_v2";
+// Turbo v2.5 = 5-10s per line vs multilingual_v2's 1-3 min. Default to
+// Turbo so timeout-during-poll is effectively impossible. Users who
+// need maximum quality can still pick multilingual_v2 from the dropdown.
+const DEFAULT_MODEL = "eleven_turbo_v2_5";
+
+// Retry config for transient failures. ai33.pro aggregator does
+// occasionally hang specific workers — a fresh task usually clears it.
+const MAX_LINE_ATTEMPTS = 3;
+const RETRY_BACKOFF_MS = 5000;
 
 interface ModelInfo {
   id: string;
@@ -113,6 +128,43 @@ interface VoiceFavorite {
   addedAt: number;
 }
 
+/**
+ * One entry in the per-line task cache. Keyed by ``fingerprint`` (a
+ * hash of voice + model + text) — same script line + same voice +
+ * same model = guaranteed-identical TTS output, so we can reuse the
+ * audio_url without paying a second time.
+ *
+ * Persisted to localStorage so a page reload or crash doesn't burn
+ * credits — pending tasks get checked via ``getTask`` on the next
+ * Generate pass, recovering audio for tasks that completed
+ * server-side while we were away.
+ */
+interface CachedLine {
+  fingerprint: string;
+  text: string;
+  voiceId: string;
+  modelId: string;
+  taskId: string;
+  status: "pending" | "done" | "failed";
+  audioUrl?: string;
+  createdAt: number;
+  lastCheckedAt: number;
+}
+
+/** Stable per-line key used for cache lookup. */
+function fingerprintLine(
+  text: string,
+  voiceId: string,
+  modelId: string,
+): string {
+  const trimmed = text.trim();
+  let h = 0;
+  for (let i = 0; i < trimmed.length; i++) {
+    h = ((h << 5) - h + trimmed.charCodeAt(i)) | 0;
+  }
+  return `${voiceId.slice(0, 12)}::${modelId}::${(h >>> 0).toString(36)}::${trimmed.length}`;
+}
+
 interface LastForm {
   voiceId: string;
   modelId: string;
@@ -173,6 +225,39 @@ export function TtsMode() {
   useEffect(() => {
     writeJson(STORAGE_KEY_FAVS, favourites);
   }, [favourites]);
+
+  // ---- per-line task cache -----------------------------------------
+  // Hydrated from localStorage. We never delete entries automatically —
+  // user clicks "Clear cache" when they want to start fresh. Cap at 500
+  // entries (LRU-style) to avoid unbounded growth.
+  const [lineCache, setLineCache] = useState<CachedLine[]>(() =>
+    readJson<CachedLine[]>(STORAGE_KEY_CACHE, []),
+  );
+  useEffect(() => {
+    writeJson(STORAGE_KEY_CACHE, lineCache);
+  }, [lineCache]);
+
+  const recordCachedTask = useCallback((entry: CachedLine) => {
+    setLineCache((prev) => {
+      const filtered = prev.filter((e) => e.fingerprint !== entry.fingerprint);
+      return [entry, ...filtered].slice(0, 500);
+    });
+  }, []);
+
+  const updateCachedTask = useCallback(
+    (fingerprint: string, patch: Partial<CachedLine>) => {
+      setLineCache((prev) =>
+        prev.map((e) =>
+          e.fingerprint === fingerprint ? { ...e, ...patch } : e,
+        ),
+      );
+    },
+    [],
+  );
+
+  const clearCache = useCallback(() => {
+    setLineCache([]);
+  }, []);
 
   const [customVoiceId, setCustomVoiceId] = useState<string>("");
   /**
@@ -336,6 +421,13 @@ export function TtsMode() {
   } | null>(null);
   const abortRef = useRef<AbortController | null>(null);
 
+  // Ref mirror of lineStates so async callbacks can read the latest
+  // values without stale-closure bugs.
+  const lineStatesRef = useRef<LineState[]>([]);
+  useEffect(() => {
+    lineStatesRef.current = lineStates;
+  }, [lineStates]);
+
   const appendLog = useCallback((msg: string) => {
     const ts = new Date().toLocaleTimeString();
     setLog((prev) => [...prev, `[${ts}] ${msg}`].slice(-200));
@@ -355,69 +447,154 @@ export function TtsMode() {
     appendLog("Cancel requested — finishing in-flight tasks before stopping…");
   }, [appendLog]);
 
-  const generate = useCallback(async () => {
-    if (busy) return;
-    if (!apiKey.trim()) {
-      appendLog("ERROR: API key is missing.");
-      return;
-    }
-    if (!lastForm.voiceId) {
-      appendLog("ERROR: select a voice first.");
-      return;
-    }
-    if (lines.length === 0) {
-      appendLog("ERROR: script is empty.");
-      return;
-    }
+  /**
+   * Process a single line: cache-check → task-recover → submit with
+   * retries. Returns the audio URL on success, throws after exhausting
+   * retries. Updates both ``lineStates`` (UI) and ``lineCache``
+   * (persistent) as it goes. Never kills the wider batch — callers
+   * decide what to do with failures.
+   */
+  const processLine = useCallback(
+    async (
+      config: VoiceApiConfig,
+      lineIndex: number,
+      text: string,
+      voiceId: string,
+      modelId: string,
+      signal: AbortSignal,
+    ): Promise<string> => {
+      const fp = fingerprintLine(text, voiceId, modelId);
+      // Read freshest cache via functional setState pattern.
+      let cached: CachedLine | undefined;
+      setLineCache((prev) => {
+        cached = prev.find((e) => e.fingerprint === fp);
+        return prev;
+      });
 
-    setBusy(true);
-    setStitchResult(null);
-    setLineStates(
-      lines.map((text, i) => ({
-        index: i,
-        text,
-        status: "pending",
-      })),
-    );
-    setLog([]);
-    appendLog(
-      `Starting TTS for ${lines.length} line(s) with voice ${lastForm.voiceId}…`,
-    );
-
-    abortRef.current = new AbortController();
-    const config = {
-      apiKey: apiKey.trim(),
-      baseUrl: lastForm.baseUrl,
-    };
-
-    try {
-      // Generate each line sequentially. ai33.pro charges per call so
-      // parallel doesn't save money — and the polling overhead is
-      // small enough that sequential is fine for human-listened audio.
-      const audioUrls: string[] = [];
-      for (let i = 0; i < lines.length; i++) {
-        if (abortRef.current.signal.aborted) {
-          appendLog("Aborted by user.");
-          break;
-        }
+      // ── Cache hit (done) — total credit save, no API call needed ──
+      if (cached?.status === "done" && cached.audioUrl) {
+        appendLog(
+          `Line ${lineIndex + 1}/${lines.length}: ⚡ cache hit — reusing audio (no credit used).`,
+        );
         setLineStates((prev) =>
           prev.map((s, idx) =>
-            idx === i ? { ...s, status: "creating" } : s,
+            idx === lineIndex
+              ? {
+                  ...s,
+                  status: "done",
+                  taskId: cached!.taskId,
+                  audioUrl: cached!.audioUrl,
+                }
+              : s,
           ),
         );
-        appendLog(`Line ${i + 1}/${lines.length}: creating TTS task…`);
+        return cached.audioUrl;
+      }
 
+      // ── Cache hit (pending) — try to recover the old task first ──
+      // Likely a previous run that timed out / crashed mid-poll. If
+      // server-side the task did eventually complete, the audio is
+      // ready and the credit was already burned — recovering it costs
+      // nothing extra.
+      if (cached?.status === "pending" && cached.taskId) {
+        try {
+          appendLog(
+            `Line ${lineIndex + 1}: checking saved task ${cached.taskId.slice(0, 8)}… (credit recovery)`,
+          );
+          setLineStates((prev) =>
+            prev.map((s, idx) =>
+              idx === lineIndex
+                ? { ...s, status: "polling", taskId: cached!.taskId }
+                : s,
+            ),
+          );
+          const existing = await getTask(config, cached.taskId);
+          if (existing.status === "done" && existing.metadata?.audio_url) {
+            const url = existing.metadata.audio_url;
+            updateCachedTask(fp, {
+              status: "done",
+              audioUrl: url,
+              lastCheckedAt: Date.now(),
+            });
+            setLineStates((prev) =>
+              prev.map((s, idx) =>
+                idx === lineIndex
+                  ? { ...s, status: "done", audioUrl: url }
+                  : s,
+              ),
+            );
+            appendLog(
+              `Line ${lineIndex + 1}: ✓ recovered audio from previous task — credit saved!`,
+            );
+            return url;
+          }
+          if (existing.status === "failed") {
+            appendLog(
+              `Line ${lineIndex + 1}: previous task failed server-side — submitting fresh.`,
+            );
+            updateCachedTask(fp, {
+              status: "failed",
+              lastCheckedAt: Date.now(),
+            });
+          }
+          // Still pending → fall through to fresh submission
+        } catch (err) {
+          appendLog(
+            `Line ${lineIndex + 1}: recovery check failed (${err instanceof Error ? err.message.slice(0, 80) : "unknown"}) — submitting fresh.`,
+          );
+        }
+      }
+
+      // ── Fresh submission with up to MAX_LINE_ATTEMPTS retries ──
+      let lastErr: unknown;
+      for (let attempt = 1; attempt <= MAX_LINE_ATTEMPTS; attempt++) {
+        if (signal.aborted) throw new Error("Aborted by user");
+        setLineStates((prev) =>
+          prev.map((s, idx) =>
+            idx === lineIndex ? { ...s, status: "creating" } : s,
+          ),
+        );
+        if (attempt === 1) {
+          appendLog(
+            `Line ${lineIndex + 1}/${lines.length}: creating TTS task…`,
+          );
+        } else {
+          appendLog(
+            `Line ${lineIndex + 1}: retry ${attempt}/${MAX_LINE_ATTEMPTS} after backoff…`,
+          );
+        }
         try {
           const task = await generateSpeech(config, {
-            voiceId: lastForm.voiceId,
-            text: lines[i],
-            modelId: lastForm.modelId,
-            signal: abortRef.current.signal,
+            voiceId,
+            text,
+            modelId,
+            signal,
+            // Persist task_id IMMEDIATELY so even if the app crashes
+            // mid-poll we can recover the audio on next run.
+            onTaskCreated: (taskId) => {
+              recordCachedTask({
+                fingerprint: fp,
+                text,
+                voiceId,
+                modelId,
+                taskId,
+                status: "pending",
+                createdAt: Date.now(),
+                lastCheckedAt: Date.now(),
+              });
+              setLineStates((prev) =>
+                prev.map((s, idx) =>
+                  idx === lineIndex ? { ...s, taskId, status: "polling" } : s,
+                ),
+              );
+            },
             onPoll: (t) => {
               if (t.status === "processing" || t.status === "pending") {
                 setLineStates((prev) =>
                   prev.map((s, idx) =>
-                    idx === i ? { ...s, status: "polling", taskId: t.id } : s,
+                    idx === lineIndex
+                      ? { ...s, status: "polling", taskId: t.id }
+                      : s,
                   ),
                 );
               }
@@ -427,40 +604,54 @@ export function TtsMode() {
           if (!url) {
             throw new Error("Task completed without an audio_url");
           }
-          audioUrls.push(url);
+          updateCachedTask(fp, {
+            status: "done",
+            audioUrl: url,
+            taskId: task.id,
+            lastCheckedAt: Date.now(),
+          });
           setLineStates((prev) =>
             prev.map((s, idx) =>
-              idx === i
-                ? {
-                    ...s,
-                    status: "done",
-                    taskId: task.id,
-                    audioUrl: url,
-                  }
+              idx === lineIndex
+                ? { ...s, status: "done", taskId: task.id, audioUrl: url }
                 : s,
             ),
           );
-          appendLog(`Line ${i + 1}/${lines.length}: ✓ ready (${url})`);
+          appendLog(`Line ${lineIndex + 1}/${lines.length}: ✓ ready`);
+          return url;
         } catch (err) {
+          lastErr = err;
+          if (signal.aborted) throw err;
           const msg = err instanceof Error ? err.message : String(err);
-          setLineStates((prev) =>
-            prev.map((s, idx) =>
-              idx === i ? { ...s, status: "failed", error: msg } : s,
-            ),
+          appendLog(
+            `Line ${lineIndex + 1}: attempt ${attempt} failed — ${msg.slice(0, 120)}`,
           );
-          appendLog(`Line ${i + 1}/${lines.length}: ✗ failed — ${msg}`);
-          // Stop on first failure — partial stitched audio doesn't
-          // make sense for scripted narration.
-          throw err;
+          if (attempt < MAX_LINE_ATTEMPTS) {
+            // Exponential-ish backoff: 5s, 10s, 15s.
+            await new Promise((r) =>
+              setTimeout(r, RETRY_BACKOFF_MS * attempt),
+            );
+          }
         }
       }
+      throw lastErr instanceof Error
+        ? lastErr
+        : new Error(String(lastErr ?? "unknown error"));
+    },
+    [appendLog, lines.length, recordCachedTask, updateCachedTask],
+  );
 
-      if (abortRef.current.signal.aborted) {
-        return;
-      }
-
-      // ---- Stitch audio + build SRT ------------------------------
-      appendLog(`Stitching ${audioUrls.length} clips with ${lastForm.silenceMs}ms silence…`);
+  /**
+   * Decode + concatenate the per-line audio URLs into a single WAV,
+   * build the matching SRT, and surface both as a ``stitchResult`` for
+   * the Output card. Pulled out so it can be reused after a retry pass
+   * completes successfully.
+   */
+  const stitchAndBuild = useCallback(
+    async (audioUrls: string[]) => {
+      appendLog(
+        `Stitching ${audioUrls.length} clips with ${lastForm.silenceMs}ms silence…`,
+      );
       const stitch: StitchResult = await fetchDecodeStitch({
         urls: audioUrls,
         silenceMs: lastForm.silenceMs,
@@ -498,13 +689,188 @@ export function TtsMode() {
         `✓ All done. Final audio ${(stitch.totalDurationMs / 1000).toFixed(1)}s, ` +
           `${(stitch.wavBlob.size / 1024 / 1024).toFixed(1)} MB. Click Download.`,
       );
+    },
+    [appendLog, lastForm.silenceMs, lines],
+  );
+
+  const generate = useCallback(async () => {
+    if (busy) return;
+    if (!apiKey.trim()) {
+      appendLog("ERROR: API key is missing.");
+      return;
+    }
+    if (!lastForm.voiceId) {
+      appendLog("ERROR: select a voice first.");
+      return;
+    }
+    if (lines.length === 0) {
+      appendLog("ERROR: script is empty.");
+      return;
+    }
+
+    setBusy(true);
+    setStitchResult(null);
+    setLineStates(
+      lines.map((text, i) => ({
+        index: i,
+        text,
+        status: "pending",
+      })),
+    );
+    setLog([]);
+    appendLog(
+      `Starting TTS for ${lines.length} line(s) with voice ${lastForm.voiceId}…`,
+    );
+
+    abortRef.current = new AbortController();
+    const config: VoiceApiConfig = {
+      apiKey: apiKey.trim(),
+      baseUrl: lastForm.baseUrl,
+    };
+
+    const audioUrls: (string | null)[] = new Array(lines.length).fill(null);
+    const failedIndices: number[] = [];
+
+    try {
+      for (let i = 0; i < lines.length; i++) {
+        if (abortRef.current.signal.aborted) {
+          appendLog("Aborted by user.");
+          break;
+        }
+        try {
+          const url = await processLine(
+            config,
+            i,
+            lines[i],
+            lastForm.voiceId,
+            lastForm.modelId,
+            abortRef.current.signal,
+          );
+          audioUrls[i] = url;
+        } catch (err) {
+          if (abortRef.current.signal.aborted) break;
+          const msg = err instanceof Error ? err.message : String(err);
+          setLineStates((prev) =>
+            prev.map((s, idx) =>
+              idx === i ? { ...s, status: "failed", error: msg } : s,
+            ),
+          );
+          appendLog(
+            `Line ${i + 1}: ✗ all ${MAX_LINE_ATTEMPTS} attempts failed — moving on. Will offer Retry below.`,
+          );
+          failedIndices.push(i);
+          // CONTINUE — don't kill the batch. User retries failures later.
+        }
+      }
+
+      if (abortRef.current.signal.aborted) return;
+
+      if (failedIndices.length > 0) {
+        appendLog(
+          `⚠ Batch finished with ${failedIndices.length} failed line(s). Click "Retry failed" to re-run just those.`,
+        );
+        return;
+      }
+
+      // All done — stitch.
+      await stitchAndBuild(audioUrls as string[]);
     } catch (err) {
-      appendLog(`FATAL: ${err instanceof Error ? err.message : String(err)}`);
+      appendLog(
+        `FATAL: ${err instanceof Error ? err.message : String(err)}`,
+      );
     } finally {
       setBusy(false);
       abortRef.current = null;
     }
-  }, [apiKey, lastForm, lines, busy, appendLog]);
+  }, [
+    apiKey,
+    lastForm,
+    lines,
+    busy,
+    appendLog,
+    processLine,
+    stitchAndBuild,
+  ]);
+
+  /**
+   * Re-run only the lines currently marked "failed". Cache lookups
+   * inside ``processLine`` will skip any line whose audio is already
+   * cached, so this also handles the "page reloaded mid-batch" case.
+   * If all lines end up done after the retry, auto-stitch.
+   */
+  const retryFailed = useCallback(async () => {
+    if (busy) return;
+    if (!apiKey.trim() || !lastForm.voiceId) return;
+
+    const failedIndices = lineStatesRef.current
+      .map((s, idx) => (s.status === "failed" ? idx : -1))
+      .filter((i) => i >= 0);
+    if (failedIndices.length === 0) return;
+
+    setBusy(true);
+    setStitchResult(null);
+    abortRef.current = new AbortController();
+    const config: VoiceApiConfig = {
+      apiKey: apiKey.trim(),
+      baseUrl: lastForm.baseUrl,
+    };
+
+    appendLog(`Retrying ${failedIndices.length} failed line(s)…`);
+
+    try {
+      for (const i of failedIndices) {
+        if (abortRef.current.signal.aborted) break;
+        setLineStates((prev) =>
+          prev.map((s, idx) =>
+            idx === i ? { ...s, status: "pending", error: undefined } : s,
+          ),
+        );
+        try {
+          await processLine(
+            config,
+            i,
+            lines[i],
+            lastForm.voiceId,
+            lastForm.modelId,
+            abortRef.current.signal,
+          );
+        } catch (err) {
+          if (abortRef.current.signal.aborted) break;
+          const msg = err instanceof Error ? err.message : String(err);
+          setLineStates((prev) =>
+            prev.map((s, idx) =>
+              idx === i ? { ...s, status: "failed", error: msg } : s,
+            ),
+          );
+          appendLog(`Line ${i + 1}: retry still failed — ${msg.slice(0, 120)}`);
+        }
+      }
+
+      if (abortRef.current.signal.aborted) return;
+
+      // Check if everything's green now — if yes, auto-stitch.
+      const latest = lineStatesRef.current;
+      const allDone = latest.every((s) => s.status === "done");
+      if (allDone) {
+        const urls = latest.map((s) => s.audioUrl!).filter(Boolean);
+        if (urls.length === latest.length) {
+          await stitchAndBuild(urls);
+        }
+      } else {
+        const stillFailed = latest.filter((s) => s.status === "failed").length;
+        appendLog(
+          `⚠ ${stillFailed} line(s) still failing. Try once more, or remove them from the script.`,
+        );
+      }
+    } catch (err) {
+      appendLog(
+        `FATAL: ${err instanceof Error ? err.message : String(err)}`,
+      );
+    } finally {
+      setBusy(false);
+      abortRef.current = null;
+    }
+  }, [busy, apiKey, lastForm, lines, appendLog, processLine, stitchAndBuild]);
 
   // Trigger a blob download with the given filename.
   const triggerDownload = useCallback((blob: Blob, filename: string) => {
@@ -893,34 +1259,92 @@ export function TtsMode() {
       </Section>
 
       <Section title="Step 5 — Generate">
-        <div className="flex flex-wrap items-center gap-3">
-          {!busy ? (
-            <button
-              type="button"
-              onClick={generate}
-              disabled={
-                !apiKey.trim() || !lastForm.voiceId || lines.length === 0
-              }
-              className="flex items-center gap-2 rounded bg-emerald-600 px-4 py-2 text-sm font-semibold text-white hover:bg-emerald-500 disabled:cursor-not-allowed disabled:bg-zinc-700 disabled:text-zinc-400"
-            >
-              <Play className="h-4 w-4" />
-              Generate voice {lines.length > 0 ? `(${lines.length} lines)` : ""}
-            </button>
-          ) : (
-            <button
-              type="button"
-              onClick={cancel}
-              className="flex items-center gap-2 rounded bg-red-600 px-4 py-2 text-sm font-semibold text-white hover:bg-red-500"
-            >
-              <Square className="h-4 w-4" />
-              Cancel
-            </button>
-          )}
-          {busy && (
-            <span className="text-xs text-zinc-400">
-              {lineStates.filter((l) => l.status === "done").length} /{" "}
-              {lineStates.length} done
-            </span>
+        <div className="space-y-2">
+          <div className="flex flex-wrap items-center gap-3">
+            {!busy ? (
+              <button
+                type="button"
+                onClick={generate}
+                disabled={
+                  !apiKey.trim() || !lastForm.voiceId || lines.length === 0
+                }
+                className="flex items-center gap-2 rounded bg-emerald-600 px-4 py-2 text-sm font-semibold text-white hover:bg-emerald-500 disabled:cursor-not-allowed disabled:bg-zinc-700 disabled:text-zinc-400"
+              >
+                <Play className="h-4 w-4" />
+                Generate voice{" "}
+                {lines.length > 0 ? `(${lines.length} lines)` : ""}
+              </button>
+            ) : (
+              <button
+                type="button"
+                onClick={cancel}
+                className="flex items-center gap-2 rounded bg-red-600 px-4 py-2 text-sm font-semibold text-white hover:bg-red-500"
+              >
+                <Square className="h-4 w-4" />
+                Cancel
+              </button>
+            )}
+
+            {/* Retry-failed — only shows when batch finished with some
+                failures. Re-runs just the failed ones (cached lines
+                are skipped automatically by processLine). */}
+            {!busy &&
+              lineStates.some((l) => l.status === "failed") && (
+                <button
+                  type="button"
+                  onClick={retryFailed}
+                  className="flex items-center gap-2 rounded bg-amber-600 px-4 py-2 text-sm font-semibold text-white hover:bg-amber-500"
+                  title="Retry only the lines that failed; cached lines are skipped"
+                >
+                  <RotateCcw className="h-4 w-4" />
+                  Retry {lineStates.filter((l) => l.status === "failed").length}{" "}
+                  failed
+                </button>
+              )}
+
+            {busy && (
+              <span className="text-xs text-zinc-400">
+                {lineStates.filter((l) => l.status === "done").length} /{" "}
+                {lineStates.length} done
+                {lineStates.filter((l) => l.status === "failed").length > 0 && (
+                  <span className="ml-2 text-red-400">
+                    ({lineStates.filter((l) => l.status === "failed").length}{" "}
+                    failed)
+                  </span>
+                )}
+              </span>
+            )}
+          </div>
+          <div className="text-[11px] text-zinc-500">
+            One failed line no longer kills the batch — processing continues,
+            and each line auto-retries up to {MAX_LINE_ATTEMPTS}× before being
+            marked failed. Task IDs are persisted so credits are recoverable
+            even after a crash.
+          </div>
+          {lineCache.length > 0 && (
+            <div className="flex items-center justify-between gap-2 rounded border border-zinc-800 bg-zinc-950/40 px-2 py-1 text-[11px] text-zinc-500">
+              <span>
+                <span className="font-mono text-zinc-300">
+                  {lineCache.filter((c) => c.status === "done").length}
+                </span>{" "}
+                cached audio clips
+                {lineCache.filter((c) => c.status === "pending").length > 0 && (
+                  <span className="ml-2 text-amber-400">
+                    + {lineCache.filter((c) => c.status === "pending").length}{" "}
+                    pending (recoverable)
+                  </span>
+                )}{" "}
+                — re-runs skip the API call for unchanged lines.
+              </span>
+              <button
+                type="button"
+                onClick={clearCache}
+                className="underline hover:text-red-400"
+                title="Clear all cached audio URLs and task IDs"
+              >
+                Clear cache
+              </button>
+            </div>
           )}
         </div>
       </Section>
