@@ -423,9 +423,21 @@ export async function runBulkQueue(
   //
   // The override lets advanced users force parallelism, but at the
   // cost of continuity quality. Most users should leave it default.
+  //
+  // HARD MEMORY CAP: even when the override says 10, we cap at
+  // MEMORY_SAFE_MAX_CONCURRENCY. Browser/Electron memory is the
+  // bottleneck, NOT API quota — a 25-chapter run with concurrency=10
+  // was peaking at 19 GB RAM on the user's Mac (PDF.js heaps + raw
+  // canvases + accumulated blobs all live simultaneously). Cap of 3
+  // keeps peak under ~3-4 GB while still giving a healthy speedup.
+  const MEMORY_SAFE_MAX_CONCURRENCY = 3;
   const concurrency = Math.max(
     1,
-    Math.min(concurrencyOverride ?? 1, Math.max(1, files.length)),
+    Math.min(
+      concurrencyOverride ?? 1,
+      Math.max(1, files.length),
+      MEMORY_SAFE_MAX_CONCURRENCY,
+    ),
   );
 
   // Shared claim counter — workers atomically grab the next file
@@ -546,13 +558,16 @@ export async function runBulkQueue(
         total: 0,
         message: `Reading ${file.name}`,
       });
-      // Pipeline overlap — speculatively prefetch the NEXT chapter
-      // this worker is likely to claim (i + concurrency away in the
-      // queue). Fires while THIS chapter is still in extract/Gemini
-      // stages, so by the time we finish here, that chapter's pages
-      // are already in the cache. Fire-and-forget; prefetch errors
-      // are ignored so a bad PDF down the line can't kill this chapter.
-      const nextLikelyIndex = i + concurrency;
+      // Pipeline overlap — speculatively prefetch the IMMEDIATELY
+      // NEXT chapter (i + 1). Old code did ``i + concurrency`` ahead
+      // which, with concurrency=3 and 3 workers, kept up to ~3
+      // chapters' page blobs pinned in the cache in addition to the
+      // ones actively being processed. Holding +1 keeps the
+      // pipeline-overlap benefit (extraction overlaps Gemini calls)
+      // without the memory amplification. Fire-and-forget; prefetch
+      // errors are ignored so a bad PDF down the line can't kill
+      // this chapter.
+      const nextLikelyIndex = i + 1;
       if (nextLikelyIndex < files.length && !pageCache.has(nextLikelyIndex)) {
         getOrPrefetchPages(nextLikelyIndex, false).catch(() => {
           /* ignore prefetch failure; the worker will retry on real consumption */

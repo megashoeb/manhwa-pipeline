@@ -512,14 +512,17 @@ export function BulkMode({ rotator }: Props) {
     items.forEach((it, idx) => indexMap.set(it.file, idx));
 
     // Parallel mode resolves to "N chapters in flight at once".
-    // • With a PAID key: cap at PAID_MAX_CONCURRENCY (10) — paid Tier 1
-    //   easily handles this and a single key unlocks full parallelism
-    //   without juggling 10 free Google accounts. This was the user's
-    //   exact ask: "ek paid key se max parallel chala do".
-    // • Free-only: N = number of enabled free keys (1 RPM-bucket per
-    //   key keeps throttle contention low).
+    // • PAID_MAX_CONCURRENCY = 3 — memory-safe ceiling. Was 10 but
+    //   profiling showed 25-chapter runs hit 19 GB RAM at concurrency
+    //   ≥ 8 because every in-flight chapter pins PDF.js heap + raw
+    //   canvases + accumulated blobs all at once. 3 keeps the peak
+    //   under ~3-4 GB and is still a 3× speedup over sequential.
+    //   bulkQueue.ts enforces the same cap defensively.
+    // • Free-only with multiple keys: still capped at the same ceiling
+    //   for the same reason — API quota was never the bottleneck;
+    //   browser/Electron memory is.
     // • concurrency undefined → bulkQueue defaults to 1 (sequential).
-    const PAID_MAX_CONCURRENCY = 10;
+    const PAID_MAX_CONCURRENCY = 3;
     const enabledKeyCount = rotator
       .list()
       .filter((k) => k.enabled && k.value.trim()).length;
@@ -527,15 +530,9 @@ export function BulkMode({ rotator }: Props) {
     let concurrency: number | undefined;
     if (parallelChapters) {
       if (hasPaid) {
-        // One paid key is enough to unlock high parallelism. If the user
-        // also added some free keys we still cap at PAID_MAX_CONCURRENCY
-        // because going beyond that hits diminishing returns.
-        concurrency = Math.min(
-          PAID_MAX_CONCURRENCY,
-          Math.max(enabledKeyCount, PAID_MAX_CONCURRENCY),
-        );
+        concurrency = PAID_MAX_CONCURRENCY;
       } else if (enabledKeyCount > 1) {
-        concurrency = enabledKeyCount;
+        concurrency = Math.min(enabledKeyCount, PAID_MAX_CONCURRENCY);
       }
     }
 
@@ -1598,13 +1595,14 @@ function ParallelToggle({
   chapterCount: number;
 }) {
   // Speedup math — assumes ~10 min per chapter sequential.
-  // Free-only: N parallel workers = N enabled keys.
-  // Paid mode: unlocks up to 10 concurrent regardless of key count
-  // (single paid key handles 1000+ RPM, way more than we'll ever push).
-  const PAID_MAX_CONCURRENCY = 10;
+  // Hard cap at 3 regardless of API tier or key count: browser/
+  // Electron memory is the bottleneck (PDF.js + raw canvases +
+  // accumulated blobs balloon at higher concurrency). bulkQueue.ts
+  // enforces the same cap server-side.
+  const MEMORY_SAFE_MAX_CONCURRENCY = 3;
   const workerCap = hasPaidKey
-    ? Math.max(PAID_MAX_CONCURRENCY, enabledKeyCount)
-    : enabledKeyCount;
+    ? MEMORY_SAFE_MAX_CONCURRENCY
+    : Math.min(enabledKeyCount, MEMORY_SAFE_MAX_CONCURRENCY);
   const effectiveWorkers = Math.max(1, Math.min(workerCap, chapterCount));
   const sequentialMin = chapterCount * 10;
   const parallelMin = Math.ceil(chapterCount / effectiveWorkers) * 10;
@@ -1660,9 +1658,13 @@ function ParallelToggle({
           <div className="mt-1 text-[12px] leading-relaxed text-zinc-400">
             Run up to <strong className="text-zinc-200">{effectiveWorkers}</strong> chapters at once
             {hasPaidKey
-              ? " (paid key unlocks high concurrency — no rate-limit pauses)."
-              : " (one per enabled key)."}{" "}
+              ? " (paid key — no rate-limit pauses)."
+              : " (capped at 3 for memory safety)."}{" "}
             Speedup is roughly {effectiveWorkers}× on large runs.
+          </div>
+          <div className="mt-1 text-[11px] leading-relaxed text-amber-400/80">
+            Memory cap: 3 parallel chapters max. More than that pushes
+            browser/Electron RAM past 5-10 GB on big PDF runs.
           </div>
           {value && canEnable && chapterCount > 1 && (
             <div className="mt-2 grid grid-cols-2 gap-x-4 gap-y-1 text-[11px] text-zinc-500 sm:grid-cols-3">
