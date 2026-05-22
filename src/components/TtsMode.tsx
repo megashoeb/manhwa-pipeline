@@ -64,8 +64,19 @@ const DEFAULT_MODEL = "eleven_turbo_v2_5";
 
 // Retry config for transient failures. ai33.pro aggregator does
 // occasionally hang specific workers — a fresh task usually clears it.
+// Backoffs are aggressive (2s/4s/8s) because at concurrency >= 5 we
+// often have other lines completing in the same window — a long retry
+// pause leaves a worker idle while siblings finish.
 const MAX_LINE_ATTEMPTS = 3;
-const RETRY_BACKOFF_MS = 5000;
+const RETRY_BACKOFF_MS = 2000;
+
+// Parallel worker count for the TTS batch loop. Default 5 = 5 lines
+// in flight at once via ai33.pro's async task endpoint. ai33 is a
+// thin ElevenLabs aggregator with no published RPM cap; 5 is a safe
+// "fast but polite" default. Users can crank to 10 via the slider
+// when they want a 600-line script done in ~5 min instead of ~10.
+const DEFAULT_CONCURRENCY = 5;
+const MAX_CONCURRENCY = 10;
 
 interface ModelInfo {
   id: string;
@@ -171,6 +182,8 @@ interface LastForm {
   scriptText: string;
   silenceMs: number;
   baseUrl: string;
+  /** How many lines to process in parallel. 1 = sequential, 10 = max. */
+  concurrency: number;
 }
 
 interface LineState {
@@ -188,15 +201,24 @@ export function TtsMode() {
   const [apiKey, setApiKey] = useState<string>(() =>
     readJson<string>(STORAGE_KEY_API, ""),
   );
-  const [lastForm, setLastForm] = useState<LastForm>(() =>
-    readJson<LastForm>(STORAGE_KEY_FORM, {
+  const [lastForm, setLastForm] = useState<LastForm>(() => {
+    const stored = readJson<LastForm>(STORAGE_KEY_FORM, {
       voiceId: "",
       modelId: DEFAULT_MODEL,
       scriptText: "",
       silenceMs: 150,
       baseUrl: "https://api.ai33.pro",
-    }),
-  );
+      concurrency: DEFAULT_CONCURRENCY,
+    });
+    // Back-compat: old persisted forms didn't have concurrency.
+    return {
+      ...stored,
+      concurrency:
+        typeof stored.concurrency === "number" && stored.concurrency > 0
+          ? Math.min(MAX_CONCURRENCY, stored.concurrency)
+          : DEFAULT_CONCURRENCY,
+    };
+  });
 
   // Persist on changes.
   useEffect(() => {
@@ -693,6 +715,82 @@ export function TtsMode() {
     [appendLog, lastForm.silenceMs, lines],
   );
 
+  /**
+   * Run ``processLine`` for the given set of line indices using a
+   * shared worker pool of size ``concurrency``. Workers claim the
+   * next-pending index atomically; per-line failures are recorded but
+   * don't kill the pool. Returns the indices that ultimately failed.
+   *
+   * Order safety: results are written by index, never by completion
+   * order, so the audioUrls array stays line-aligned for stitching.
+   */
+  const runWorkerPool = useCallback(
+    async (
+      config: VoiceApiConfig,
+      indicesToProcess: number[],
+      voiceId: string,
+      modelId: string,
+      concurrency: number,
+      signal: AbortSignal,
+      audioUrls: (string | null)[],
+    ): Promise<number[]> => {
+      const failedIndices: number[] = [];
+      let claimPos = 0;
+      const claimNext = (): number | null => {
+        if (signal.aborted) return null;
+        if (claimPos >= indicesToProcess.length) return null;
+        return indicesToProcess[claimPos++];
+      };
+
+      const workerCount = Math.max(
+        1,
+        Math.min(concurrency, indicesToProcess.length),
+      );
+
+      const worker = async (workerId: number): Promise<void> => {
+        // Tiny stagger between worker starts so the initial burst
+        // doesn't slam ai33's submission endpoint with N requests in
+        // the same millisecond — spreads to ~50ms gaps for the first
+        // wave. After that, completion timing naturally spreads them.
+        await new Promise((r) => setTimeout(r, workerId * 50));
+        while (true) {
+          if (signal.aborted) return;
+          const i = claimNext();
+          if (i === null) return;
+          try {
+            const url = await processLine(
+              config,
+              i,
+              lines[i],
+              voiceId,
+              modelId,
+              signal,
+            );
+            audioUrls[i] = url;
+          } catch (err) {
+            if (signal.aborted) return;
+            const msg = err instanceof Error ? err.message : String(err);
+            setLineStates((prev) =>
+              prev.map((s, idx) =>
+                idx === i ? { ...s, status: "failed", error: msg } : s,
+              ),
+            );
+            appendLog(
+              `Line ${i + 1}: ✗ all ${MAX_LINE_ATTEMPTS} attempts failed — pool will continue with next line.`,
+            );
+            failedIndices.push(i);
+          }
+        }
+      };
+
+      await Promise.all(
+        Array.from({ length: workerCount }, (_, id) => worker(id)),
+      );
+      return failedIndices;
+    },
+    [appendLog, lines, processLine],
+  );
+
   const generate = useCallback(async () => {
     if (busy) return;
     if (!apiKey.trim()) {
@@ -718,9 +816,14 @@ export function TtsMode() {
       })),
     );
     setLog([]);
-    appendLog(
-      `Starting TTS for ${lines.length} line(s) with voice ${lastForm.voiceId}…`,
+    const concurrency = Math.max(
+      1,
+      Math.min(MAX_CONCURRENCY, lastForm.concurrency || DEFAULT_CONCURRENCY),
     );
+    appendLog(
+      `Starting TTS for ${lines.length} line(s) with voice ${lastForm.voiceId} — ${concurrency}× parallel workers.`,
+    );
+    const t0 = Date.now();
 
     abortRef.current = new AbortController();
     const config: VoiceApiConfig = {
@@ -729,50 +832,36 @@ export function TtsMode() {
     };
 
     const audioUrls: (string | null)[] = new Array(lines.length).fill(null);
-    const failedIndices: number[] = [];
+    const allIndices = Array.from({ length: lines.length }, (_, i) => i);
 
     try {
-      for (let i = 0; i < lines.length; i++) {
-        if (abortRef.current.signal.aborted) {
-          appendLog("Aborted by user.");
-          break;
-        }
-        try {
-          const url = await processLine(
-            config,
-            i,
-            lines[i],
-            lastForm.voiceId,
-            lastForm.modelId,
-            abortRef.current.signal,
-          );
-          audioUrls[i] = url;
-        } catch (err) {
-          if (abortRef.current.signal.aborted) break;
-          const msg = err instanceof Error ? err.message : String(err);
-          setLineStates((prev) =>
-            prev.map((s, idx) =>
-              idx === i ? { ...s, status: "failed", error: msg } : s,
-            ),
-          );
-          appendLog(
-            `Line ${i + 1}: ✗ all ${MAX_LINE_ATTEMPTS} attempts failed — moving on. Will offer Retry below.`,
-          );
-          failedIndices.push(i);
-          // CONTINUE — don't kill the batch. User retries failures later.
-        }
+      const failedIndices = await runWorkerPool(
+        config,
+        allIndices,
+        lastForm.voiceId,
+        lastForm.modelId,
+        concurrency,
+        abortRef.current.signal,
+        audioUrls,
+      );
+
+      if (abortRef.current.signal.aborted) {
+        appendLog("Aborted by user.");
+        return;
       }
 
-      if (abortRef.current.signal.aborted) return;
+      const elapsed = ((Date.now() - t0) / 1000).toFixed(1);
 
       if (failedIndices.length > 0) {
         appendLog(
-          `⚠ Batch finished with ${failedIndices.length} failed line(s). Click "Retry failed" to re-run just those.`,
+          `⚠ Pool finished in ${elapsed}s with ${failedIndices.length} failed line(s). Click "Retry failed" to re-run just those.`,
         );
         return;
       }
 
-      // All done — stitch.
+      appendLog(
+        `✓ All ${lines.length} lines generated in ${elapsed}s. Stitching now…`,
+      );
       await stitchAndBuild(audioUrls as string[]);
     } catch (err) {
       appendLog(
@@ -788,7 +877,7 @@ export function TtsMode() {
     lines,
     busy,
     appendLog,
-    processLine,
+    runWorkerPool,
     stitchAndBuild,
   ]);
 
@@ -815,38 +904,44 @@ export function TtsMode() {
       baseUrl: lastForm.baseUrl,
     };
 
-    appendLog(`Retrying ${failedIndices.length} failed line(s)…`);
+    const concurrency = Math.max(
+      1,
+      Math.min(MAX_CONCURRENCY, lastForm.concurrency || DEFAULT_CONCURRENCY),
+    );
+    appendLog(
+      `Retrying ${failedIndices.length} failed line(s) with ${Math.min(concurrency, failedIndices.length)}× parallel workers…`,
+    );
+    const t0 = Date.now();
+
+    // Reset state for the lines we're retrying so the UI shows them
+    // as in-flight again.
+    setLineStates((prev) =>
+      prev.map((s, idx) =>
+        failedIndices.includes(idx)
+          ? { ...s, status: "pending", error: undefined }
+          : s,
+      ),
+    );
+
+    // Sparse array indexed by line index — workers fill in the URLs
+    // they generate; we read the final URL list off lineStatesRef
+    // (which gets updated inside processLine) after the pool drains.
+    const audioUrls: (string | null)[] = new Array(lines.length).fill(null);
 
     try {
-      for (const i of failedIndices) {
-        if (abortRef.current.signal.aborted) break;
-        setLineStates((prev) =>
-          prev.map((s, idx) =>
-            idx === i ? { ...s, status: "pending", error: undefined } : s,
-          ),
-        );
-        try {
-          await processLine(
-            config,
-            i,
-            lines[i],
-            lastForm.voiceId,
-            lastForm.modelId,
-            abortRef.current.signal,
-          );
-        } catch (err) {
-          if (abortRef.current.signal.aborted) break;
-          const msg = err instanceof Error ? err.message : String(err);
-          setLineStates((prev) =>
-            prev.map((s, idx) =>
-              idx === i ? { ...s, status: "failed", error: msg } : s,
-            ),
-          );
-          appendLog(`Line ${i + 1}: retry still failed — ${msg.slice(0, 120)}`);
-        }
-      }
+      await runWorkerPool(
+        config,
+        failedIndices,
+        lastForm.voiceId,
+        lastForm.modelId,
+        concurrency,
+        abortRef.current.signal,
+        audioUrls,
+      );
 
       if (abortRef.current.signal.aborted) return;
+
+      const elapsed = ((Date.now() - t0) / 1000).toFixed(1);
 
       // Check if everything's green now — if yes, auto-stitch.
       const latest = lineStatesRef.current;
@@ -854,12 +949,13 @@ export function TtsMode() {
       if (allDone) {
         const urls = latest.map((s) => s.audioUrl!).filter(Boolean);
         if (urls.length === latest.length) {
+          appendLog(`✓ Retry finished in ${elapsed}s — all green. Stitching…`);
           await stitchAndBuild(urls);
         }
       } else {
         const stillFailed = latest.filter((s) => s.status === "failed").length;
         appendLog(
-          `⚠ ${stillFailed} line(s) still failing. Try once more, or remove them from the script.`,
+          `⚠ Retry finished in ${elapsed}s — ${stillFailed} line(s) still failing. Try once more, or remove them from the script.`,
         );
       }
     } catch (err) {
@@ -870,7 +966,7 @@ export function TtsMode() {
       setBusy(false);
       abortRef.current = null;
     }
-  }, [busy, apiKey, lastForm, lines, appendLog, processLine, stitchAndBuild]);
+  }, [busy, apiKey, lastForm, lines, appendLog, runWorkerPool, stitchAndBuild]);
 
   // Trigger a blob download with the given filename.
   const triggerDownload = useCallback((blob: Blob, filename: string) => {
@@ -1232,28 +1328,85 @@ export function TtsMode() {
       </Section>
 
       <Section title="Step 4 — Generation options">
-        <div className="space-y-2">
-          <label className="block text-xs font-medium text-zinc-400">
-            Silence between lines:{" "}
-            <span className="font-mono text-zinc-200">
-              {lastForm.silenceMs} ms
-            </span>
-          </label>
-          <input
-            type="range"
-            min={0}
-            max={1000}
-            step={25}
-            value={lastForm.silenceMs}
-            onChange={(e) =>
-              updateForm({ silenceMs: parseInt(e.target.value, 10) })
-            }
-            className="w-full accent-blue-500"
-          />
-          <div className="flex justify-between text-[10px] text-zinc-600">
-            <span>0 ms (no gap)</span>
-            <span>500 ms (natural pause)</span>
-            <span>1000 ms (long pause)</span>
+        <div className="space-y-5">
+          <div className="space-y-2">
+            <label className="block text-xs font-medium text-zinc-400">
+              Silence between lines:{" "}
+              <span className="font-mono text-zinc-200">
+                {lastForm.silenceMs} ms
+              </span>
+            </label>
+            <input
+              type="range"
+              min={0}
+              max={1000}
+              step={25}
+              value={lastForm.silenceMs}
+              onChange={(e) =>
+                updateForm({ silenceMs: parseInt(e.target.value, 10) })
+              }
+              className="w-full accent-blue-500"
+            />
+            <div className="flex justify-between text-[10px] text-zinc-600">
+              <span>0 ms (no gap)</span>
+              <span>500 ms (natural pause)</span>
+              <span>1000 ms (long pause)</span>
+            </div>
+          </div>
+
+          {/* Parallel workers — biggest speed lever. Cost stays the
+              same (per-character billing); only wall-clock time
+              changes. 5 is the safe default, 10 is "I want it now". */}
+          <div className="space-y-2">
+            <label className="block text-xs font-medium text-zinc-400">
+              Parallel workers:{" "}
+              <span className="font-mono text-amber-300">
+                {lastForm.concurrency}×
+              </span>
+              <span className="ml-2 text-[10px] font-normal text-zinc-500">
+                (more workers = faster, same credit cost)
+              </span>
+            </label>
+            <input
+              type="range"
+              min={1}
+              max={MAX_CONCURRENCY}
+              step={1}
+              value={lastForm.concurrency}
+              onChange={(e) =>
+                updateForm({ concurrency: parseInt(e.target.value, 10) })
+              }
+              className="w-full accent-amber-500"
+            />
+            <div className="flex justify-between text-[10px] text-zinc-600">
+              <span>1× (safe)</span>
+              <span>5× (recommended)</span>
+              <span>{MAX_CONCURRENCY}× (max speed)</span>
+            </div>
+            {lines.length > 0 && (
+              <div className="rounded bg-zinc-950/40 px-2 py-1.5 text-[11px] text-zinc-400">
+                Estimated time for {lines.length} line
+                {lines.length === 1 ? "" : "s"}:{" "}
+                <span className="font-mono text-emerald-300">
+                  {(() => {
+                    // Rough estimate: each line ≈ 3-5 sec wall-clock
+                    // (submit + poll + download) at Turbo. Pool spreads
+                    // evenly across workers.
+                    const perLineSec = 4;
+                    const totalSec =
+                      (lines.length * perLineSec) /
+                      Math.max(1, lastForm.concurrency);
+                    if (totalSec < 60) return `~${Math.round(totalSec)} sec`;
+                    return `~${Math.round(totalSec / 60)} min`;
+                  })()}
+                </span>
+                {lastForm.concurrency >= 8 && (
+                  <span className="ml-2 text-amber-400">
+                    ⚠ aggressive — bump down if you see 429s
+                  </span>
+                )}
+              </div>
+            )}
           </div>
         </div>
       </Section>

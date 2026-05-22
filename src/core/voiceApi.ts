@@ -209,7 +209,11 @@ export async function pollTaskUntilDone(
   taskId: string,
   opts: PollOptions = {},
 ): Promise<TaskResponse> {
-  const interval = opts.intervalMs ?? 2000;
+  // 1 sec default — Turbo v2.5 finishes a typical line in 1-2 sec
+  // server-side. 2-sec polling was the main reason a 1-sec generation
+  // looked like 3 sec to the user. 1-sec interval picks it up fast
+  // without hammering the API.
+  const interval = opts.intervalMs ?? 1000;
   // 15 min default — ai33.pro aggregator can be slow at peak times,
   // especially with eleven_multilingual_v2. 5 min was too tight; we
   // were aborting polls on tasks that completed seconds later, wasting
