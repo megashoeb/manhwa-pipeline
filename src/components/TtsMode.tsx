@@ -26,12 +26,16 @@ import {
   Mic,
   Play,
   RefreshCw,
+  Search,
   Square,
+  Star,
+  Trash2,
 } from "lucide-react";
 import clsx from "clsx";
 
 import {
   generateSpeech,
+  getVoice,
   listVoices,
   type Voice,
 } from "../core/voiceApi";
@@ -44,15 +48,70 @@ import { readJson, writeJson } from "../core/storage";
 
 const STORAGE_KEY_API = "manhwa.tts.apiKey";
 const STORAGE_KEY_FORM = "manhwa.tts.lastForm";
+const STORAGE_KEY_FAVS = "manhwa.tts.favourites";
 
 const DEFAULT_MODEL = "eleven_multilingual_v2";
-const COMMON_MODELS = [
-  "eleven_multilingual_v2",
-  "eleven_turbo_v2_5",
-  "eleven_turbo_v2",
-  "eleven_flash_v2_5",
-  "eleven_monolingual_v1",
+
+interface ModelInfo {
+  id: string;
+  label: string;
+  tag: "high-quality" | "newest" | "turbo";
+  description: string;
+}
+
+/**
+ * All ElevenLabs models exposed via ai33.pro. ``label`` shown in the
+ * dropdown. Tags + descriptions help the user pick without needing
+ * to read external docs.
+ */
+const COMMON_MODELS: ModelInfo[] = [
+  {
+    id: "eleven_multilingual_v2",
+    label: "Eleven Multilingual v2",
+    tag: "high-quality",
+    description: "Most life-like, emotionally rich. 29 languages. Best for voice-overs + audiobooks.",
+  },
+  {
+    id: "eleven_v3",
+    label: "Eleven v3 (alpha)",
+    tag: "newest",
+    description: "Most expressive. 70+ languages. Needs more prompt engineering — quality varies.",
+  },
+  {
+    id: "eleven_flash_v2_5",
+    label: "Eleven Flash v2.5",
+    tag: "turbo",
+    description: "Ultra low latency. 32 languages. Best for conversational use cases.",
+  },
+  {
+    id: "eleven_turbo_v2_5",
+    label: "Eleven Turbo v2.5",
+    tag: "turbo",
+    description: "High quality + low latency. 32 languages. Best speed-quality balance.",
+  },
+  {
+    id: "eleven_turbo_v2",
+    label: "Eleven Turbo v2",
+    tag: "turbo",
+    description: "English-only, low latency. Same speed as Turbo v2.5 but English only.",
+  },
+  {
+    id: "eleven_flash_v2",
+    label: "Eleven Flash v2",
+    tag: "turbo",
+    description: "Older flash model. Use Flash v2.5 instead unless you specifically need v2.",
+  },
 ];
+
+/** One saved voice in the favourites list. */
+interface VoiceFavorite {
+  voice_id: string;
+  name: string;
+  /** Optional category (e.g. "premade", "generated", "professional"). */
+  category?: string;
+  /** Timestamp added — used for sorting newest-first. */
+  addedAt: number;
+}
 
 interface LastForm {
   voiceId: string;
@@ -103,6 +162,80 @@ export function TtsMode() {
   const [voices, setVoices] = useState<Voice[]>([]);
   const [voicesLoading, setVoicesLoading] = useState(false);
   const [voicesError, setVoicesError] = useState<string | null>(null);
+
+  // ---- favourites + custom voice ID lookup -------------------------
+  // Persistent list of voice IDs the user has explicitly saved. Lets
+  // them paste an ID once (e.g. from ElevenLabs Voice Library), save
+  // it, and click a chip next time instead of re-typing.
+  const [favourites, setFavourites] = useState<VoiceFavorite[]>(() =>
+    readJson<VoiceFavorite[]>(STORAGE_KEY_FAVS, []),
+  );
+  useEffect(() => {
+    writeJson(STORAGE_KEY_FAVS, favourites);
+  }, [favourites]);
+
+  const [customVoiceId, setCustomVoiceId] = useState<string>("");
+  const [lookupResult, setLookupResult] = useState<Voice | null>(null);
+  const [lookupBusy, setLookupBusy] = useState(false);
+  const [lookupError, setLookupError] = useState<string | null>(null);
+
+  const lookupVoice = useCallback(async () => {
+    const trimmed = customVoiceId.trim();
+    if (!trimmed) {
+      setLookupError("Paste a voice ID first.");
+      return;
+    }
+    if (!apiKey.trim()) {
+      setLookupError("Add your API key first.");
+      return;
+    }
+    setLookupBusy(true);
+    setLookupError(null);
+    setLookupResult(null);
+    try {
+      const voice = await getVoice(
+        { apiKey: apiKey.trim(), baseUrl: lastForm.baseUrl },
+        trimmed,
+      );
+      setLookupResult(voice);
+      // Also select it immediately so the user can hit Generate.
+      updateForm({ voiceId: voice.voice_id });
+    } catch (err) {
+      setLookupError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setLookupBusy(false);
+    }
+  }, [customVoiceId, apiKey, lastForm.baseUrl, updateForm]);
+
+  const saveFavourite = useCallback(
+    (voice: Voice) => {
+      setFavourites((prev) => {
+        // Dedupe by voice_id — re-save just updates the timestamp.
+        const filtered = prev.filter((f) => f.voice_id !== voice.voice_id);
+        const next: VoiceFavorite = {
+          voice_id: voice.voice_id,
+          name: voice.name,
+          category: voice.category,
+          addedAt: Date.now(),
+        };
+        return [next, ...filtered].slice(0, 30); // cap at 30
+      });
+    },
+    [],
+  );
+
+  const removeFavourite = useCallback((voiceId: string) => {
+    setFavourites((prev) => prev.filter((f) => f.voice_id !== voiceId));
+  }, []);
+
+  const selectFavourite = useCallback(
+    (fav: VoiceFavorite) => {
+      updateForm({ voiceId: fav.voice_id });
+      setCustomVoiceId("");
+      setLookupResult(null);
+    },
+    [updateForm],
+  );
 
   const reloadVoices = useCallback(async () => {
     if (!apiKey.trim()) {
@@ -386,12 +519,13 @@ export function TtsMode() {
       </Section>
 
       <Section title="Step 2 — Voice + model">
-        <div className="space-y-3">
+        <div className="space-y-4">
+          {/* Voice dropdown loaded from /v2/voices */}
           <div className="flex items-end gap-2">
             <div className="flex-1">
               <label className="mb-1 block text-xs font-medium text-zinc-400">
                 <Mic className="mr-1 inline h-3 w-3" />
-                Voice
+                Voice (from your library)
               </label>
               <select
                 value={lastForm.voiceId}
@@ -433,6 +567,133 @@ export function TtsMode() {
               {voicesError}
             </div>
           )}
+
+          {/* Custom voice ID lookup — paste any voice_id from
+              ElevenLabs voice library / community voices and use it
+              directly. Lookup fetches metadata + lets you save to
+              favourites for one-click re-use later. */}
+          <div className="rounded border border-zinc-800 bg-zinc-950/40 p-3">
+            <label className="mb-1 block text-xs font-medium text-zinc-400">
+              <Search className="mr-1 inline h-3 w-3" />
+              Custom voice ID (advanced)
+            </label>
+            <div className="flex items-center gap-2">
+              <input
+                type="text"
+                value={customVoiceId}
+                onChange={(e) => {
+                  setCustomVoiceId(e.target.value);
+                  setLookupResult(null);
+                  setLookupError(null);
+                }}
+                onKeyDown={(e) => {
+                  if (e.key === "Enter") {
+                    e.preventDefault();
+                    lookupVoice();
+                  }
+                }}
+                placeholder="Paste voice_id, e.g. 21m00Tcm4TlvDq8ikWAM"
+                className="flex-1 rounded border border-zinc-700 bg-zinc-950 px-2.5 py-1.5 font-mono text-xs text-zinc-100 placeholder-zinc-600 focus:border-blue-500 focus:outline-none"
+              />
+              <button
+                type="button"
+                onClick={lookupVoice}
+                disabled={lookupBusy || !customVoiceId.trim() || !apiKey.trim()}
+                className="flex h-8 items-center gap-1 rounded bg-blue-600 px-3 text-xs font-semibold text-white hover:bg-blue-500 disabled:cursor-not-allowed disabled:bg-zinc-700"
+              >
+                {lookupBusy ? (
+                  <Loader2 className="h-3 w-3 animate-spin" />
+                ) : (
+                  <Search className="h-3 w-3" />
+                )}
+                Lookup
+              </button>
+            </div>
+            {lookupError && (
+              <div className="mt-2 rounded bg-red-950/40 px-2 py-1 text-[11px] text-red-300">
+                {lookupError}
+              </div>
+            )}
+            {lookupResult && (
+              <div className="mt-2 flex items-center justify-between gap-2 rounded border border-emerald-700/40 bg-emerald-950/30 px-2 py-1.5">
+                <div className="min-w-0 flex-1">
+                  <div className="text-xs font-semibold text-emerald-200">
+                    ✓ {lookupResult.name}
+                    {lookupResult.category && (
+                      <span className="ml-1 text-[10px] font-normal text-emerald-300/70">
+                        ({lookupResult.category})
+                      </span>
+                    )}
+                  </div>
+                  <code className="text-[10px] text-emerald-300/60">
+                    {lookupResult.voice_id}
+                  </code>
+                </div>
+                <button
+                  type="button"
+                  onClick={() => saveFavourite(lookupResult)}
+                  className="flex items-center gap-1 rounded bg-amber-600 px-2 py-1 text-[11px] font-semibold text-white hover:bg-amber-500"
+                  title="Save to favourites for one-click re-use"
+                >
+                  <Star className="h-3 w-3" />
+                  Save to favourites
+                </button>
+              </div>
+            )}
+          </div>
+
+          {/* Favourites — clickable chips for quick voice switching */}
+          {favourites.length > 0 && (
+            <div>
+              <label className="mb-1.5 block text-xs font-medium text-zinc-400">
+                <Star className="mr-1 inline h-3 w-3 text-amber-400" />
+                Favourites ({favourites.length})
+              </label>
+              <div className="flex flex-wrap gap-1.5">
+                {favourites.map((fav) => {
+                  const isActive = lastForm.voiceId === fav.voice_id;
+                  return (
+                    <div
+                      key={fav.voice_id}
+                      className={clsx(
+                        "group flex items-center gap-1 rounded border px-2 py-1 text-[11px] transition",
+                        isActive
+                          ? "border-amber-500/60 bg-amber-950/40 text-amber-200"
+                          : "border-zinc-700 bg-zinc-900/60 text-zinc-300 hover:border-zinc-500",
+                      )}
+                    >
+                      <button
+                        type="button"
+                        onClick={() => selectFavourite(fav)}
+                        className="font-medium"
+                        title={`Voice ID: ${fav.voice_id}`}
+                      >
+                        {isActive && (
+                          <Star className="mr-1 inline h-2.5 w-2.5 fill-amber-400 text-amber-400" />
+                        )}
+                        {fav.name}
+                        {fav.category && (
+                          <span className="ml-1 text-[9px] opacity-60">
+                            {fav.category}
+                          </span>
+                        )}
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => removeFavourite(fav.voice_id)}
+                        className="opacity-0 transition group-hover:opacity-100"
+                        title="Remove from favourites"
+                      >
+                        <Trash2 className="h-2.5 w-2.5 text-zinc-500 hover:text-red-400" />
+                      </button>
+                    </div>
+                  );
+                })}
+              </div>
+            </div>
+          )}
+
+          {/* Model picker — all 6 ElevenLabs models with descriptions */}
           <div>
             <label className="mb-1 block text-xs font-medium text-zinc-400">
               Model
@@ -443,11 +704,36 @@ export function TtsMode() {
               className="w-full rounded border border-zinc-700 bg-zinc-950 px-3 py-2 text-sm text-zinc-100 focus:border-blue-500 focus:outline-none"
             >
               {COMMON_MODELS.map((m) => (
-                <option key={m} value={m}>
-                  {m}
+                <option key={m.id} value={m.id}>
+                  {m.label} — {m.description}
                 </option>
               ))}
             </select>
+            {/* Inline description card for the currently-selected model */}
+            {(() => {
+              const selected = COMMON_MODELS.find(
+                (m) => m.id === lastForm.modelId,
+              );
+              if (!selected) return null;
+              const tagStyles: Record<ModelInfo["tag"], string> = {
+                "high-quality": "bg-emerald-950 text-emerald-300",
+                newest: "bg-purple-950 text-purple-300",
+                turbo: "bg-amber-950 text-amber-300",
+              };
+              return (
+                <div className="mt-1.5 flex items-start gap-2 rounded bg-zinc-950/60 px-2 py-1.5 text-[11px] text-zinc-400">
+                  <span
+                    className={clsx(
+                      "shrink-0 rounded px-1.5 py-0.5 text-[9px] font-semibold uppercase tracking-wide",
+                      tagStyles[selected.tag],
+                    )}
+                  >
+                    {selected.tag}
+                  </span>
+                  <span className="leading-relaxed">{selected.description}</span>
+                </div>
+              );
+            })()}
           </div>
         </div>
       </Section>

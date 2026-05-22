@@ -79,6 +79,33 @@ function baseUrl(config: VoiceApiConfig): string {
 }
 
 /**
+ * Look up a single voice by ID. Powers the "Custom voice ID" field
+ * in the TtsMode UI — user pastes a voice_id from elsewhere (e.g.
+ * ElevenLabs voice library), we validate it exists + fetch the
+ * voice's name + category for display before saving to favourites.
+ */
+export async function getVoice(
+  config: VoiceApiConfig,
+  voiceId: string,
+): Promise<Voice> {
+  const res = await fetch(
+    `${baseUrl(config)}/v1/voices/${encodeURIComponent(voiceId)}`,
+    { headers: authHeaders(config) },
+  );
+  if (!res.ok) {
+    const detail = await res.text().catch(() => "");
+    throw new Error(
+      `Voice lookup failed (HTTP ${res.status})${detail ? `: ${detail.slice(0, 200)}` : ""}`,
+    );
+  }
+  const data = (await res.json()) as Voice;
+  if (!data.voice_id) {
+    throw new Error("Voice lookup returned no voice_id");
+  }
+  return data;
+}
+
+/**
  * Fetch the list of voices the user can pick from. Mirrors the
  * ElevenLabs ``/v2/voices`` response shape; returns the flat array.
  */
