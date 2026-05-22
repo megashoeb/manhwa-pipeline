@@ -178,35 +178,20 @@ export function TtsMode() {
   const [lookupResult, setLookupResult] = useState<Voice | null>(null);
   const [lookupBusy, setLookupBusy] = useState(false);
   const [lookupError, setLookupError] = useState<string | null>(null);
+  /**
+   * When the API lookup fails with 404 (most commonly a shared /
+   * community voice the user hasn't added to their library), we
+   * offer a "save manually" path — user types their own label and
+   * saves the raw ID to favourites. Re-using the chip from
+   * favourites still uses the ID directly with the TTS endpoint,
+   * which often works for shared voices even when GET /v1/voices
+   * doesn't.
+   */
+  const [showManualSave, setShowManualSave] = useState(false);
+  const [manualSaveName, setManualSaveName] = useState("");
 
-  const lookupVoice = useCallback(async () => {
-    const trimmed = customVoiceId.trim();
-    if (!trimmed) {
-      setLookupError("Paste a voice ID first.");
-      return;
-    }
-    if (!apiKey.trim()) {
-      setLookupError("Add your API key first.");
-      return;
-    }
-    setLookupBusy(true);
-    setLookupError(null);
-    setLookupResult(null);
-    try {
-      const voice = await getVoice(
-        { apiKey: apiKey.trim(), baseUrl: lastForm.baseUrl },
-        trimmed,
-      );
-      setLookupResult(voice);
-      // Also select it immediately so the user can hit Generate.
-      updateForm({ voiceId: voice.voice_id });
-    } catch (err) {
-      setLookupError(err instanceof Error ? err.message : String(err));
-    } finally {
-      setLookupBusy(false);
-    }
-  }, [customVoiceId, apiKey, lastForm.baseUrl, updateForm]);
-
+  // Favourites operations declared BEFORE lookup/manual-save so the
+  // closures over them satisfy temporal-dead-zone strictness.
   const saveFavourite = useCallback(
     (voice: Voice) => {
       setFavourites((prev) => {
@@ -227,6 +212,76 @@ export function TtsMode() {
   const removeFavourite = useCallback((voiceId: string) => {
     setFavourites((prev) => prev.filter((f) => f.voice_id !== voiceId));
   }, []);
+
+  const lookupVoice = useCallback(async () => {
+    const trimmed = customVoiceId.trim();
+    if (!trimmed) {
+      setLookupError("Paste a voice ID first.");
+      return;
+    }
+    if (!apiKey.trim()) {
+      setLookupError("Add your API key first.");
+      return;
+    }
+    setLookupBusy(true);
+    setLookupError(null);
+    setLookupResult(null);
+    setShowManualSave(false);
+
+    // Fast path — check if the voice is already in the loaded /v2/voices
+    // list (user's own library). Saves an API call + works offline.
+    const local = voices.find((v) => v.voice_id === trimmed);
+    if (local) {
+      setLookupResult(local);
+      updateForm({ voiceId: local.voice_id });
+      setLookupBusy(false);
+      return;
+    }
+
+    try {
+      const voice = await getVoice(
+        { apiKey: apiKey.trim(), baseUrl: lastForm.baseUrl },
+        trimmed,
+      );
+      setLookupResult(voice);
+      updateForm({ voiceId: voice.voice_id });
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      setLookupError(msg);
+      // 404 = voice exists in ElevenLabs but not in this user's
+      // library (shared / community voices). Offer the manual-save
+      // fallback so they can still use it.
+      if (/404/.test(msg) || /not.?found/i.test(msg)) {
+        setShowManualSave(true);
+        setManualSaveName("");
+      }
+    } finally {
+      setLookupBusy(false);
+    }
+  }, [customVoiceId, apiKey, lastForm.baseUrl, updateForm, voices]);
+
+  /**
+   * Save a voice ID to favourites without API confirmation — used
+   * when the user pastes a shared / community voice that isn't in
+   * their library yet. The user types whatever label they want;
+   * we trust them on the ID.
+   */
+  const manualSave = useCallback(() => {
+    const id = customVoiceId.trim();
+    const name = manualSaveName.trim();
+    if (!id || !name) return;
+    const synthetic: Voice = {
+      voice_id: id,
+      name,
+      category: "manual",
+    };
+    saveFavourite(synthetic);
+    updateForm({ voiceId: id });
+    setShowManualSave(false);
+    setLookupError(null);
+    setLookupResult(synthetic);
+    setManualSaveName("");
+  }, [customVoiceId, manualSaveName, saveFavourite, updateForm]);
 
   const selectFavourite = useCallback(
     (fav: VoiceFavorite) => {
@@ -612,6 +667,49 @@ export function TtsMode() {
             {lookupError && (
               <div className="mt-2 rounded bg-red-950/40 px-2 py-1 text-[11px] text-red-300">
                 {lookupError}
+                {showManualSave && (
+                  <div className="mt-1 text-amber-300/90">
+                    This voice isn&apos;t in your library — likely a shared /
+                    community voice. You can still save it manually below
+                    and use it directly.
+                  </div>
+                )}
+              </div>
+            )}
+            {showManualSave && (
+              <div className="mt-2 rounded border border-amber-700/40 bg-amber-950/30 p-2.5">
+                <div className="mb-1.5 text-[11px] font-semibold text-amber-200">
+                  Save without lookup
+                </div>
+                <div className="mb-2 text-[10px] text-amber-200/70 leading-relaxed">
+                  Type a label (e.g. &quot;Brahma deep narrator&quot;) and we&apos;ll
+                  save the voice ID to favourites. The TTS endpoint
+                  often works with shared IDs even when lookup doesn&apos;t.
+                </div>
+                <div className="flex items-center gap-2">
+                  <input
+                    type="text"
+                    value={manualSaveName}
+                    onChange={(e) => setManualSaveName(e.target.value)}
+                    onKeyDown={(e) => {
+                      if (e.key === "Enter") {
+                        e.preventDefault();
+                        manualSave();
+                      }
+                    }}
+                    placeholder="Voice label (your choice)"
+                    className="flex-1 rounded border border-zinc-700 bg-zinc-950 px-2 py-1.5 text-xs text-zinc-100 placeholder-zinc-600 focus:border-amber-500 focus:outline-none"
+                  />
+                  <button
+                    type="button"
+                    onClick={manualSave}
+                    disabled={!manualSaveName.trim()}
+                    className="flex h-7 items-center gap-1 rounded bg-amber-600 px-2.5 text-[11px] font-semibold text-white hover:bg-amber-500 disabled:cursor-not-allowed disabled:opacity-50"
+                  >
+                    <Star className="h-3 w-3" />
+                    Save anyway
+                  </button>
+                </div>
               </div>
             )}
             {lookupResult && (
