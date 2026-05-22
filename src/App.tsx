@@ -6,6 +6,7 @@ import {
   Download,
   FileText,
   Files,
+  Mic,
 } from "lucide-react";
 import clsx from "clsx";
 
@@ -16,6 +17,7 @@ import { FilterSettingsPanel } from "./components/FilterSettings";
 import { ApiKeyManager } from "./components/ApiKeyManager";
 import { ScriptOutput } from "./components/ScriptOutput";
 import { BulkMode } from "./components/BulkMode";
+import { TtsMode } from "./components/TtsMode";
 
 import {
   extractPdfPages,
@@ -48,7 +50,7 @@ interface Progress {
 
 const GEMINI_MODEL = "gemini-3.1-flash-lite";
 
-type AppMode = "single" | "bulk";
+type AppMode = "single" | "bulk" | "tts";
 
 function App() {
   // One KeyRotator instance for the lifetime of the app, persisted to localStorage.
@@ -249,6 +251,8 @@ function App() {
 
         {mode === "bulk" ? (
           <BulkMode rotator={rotator} />
+        ) : mode === "tts" ? (
+          <TtsMode />
         ) : (
           <SingleModeContent
             pages={pages}
@@ -472,6 +476,14 @@ function ModeToggle({
         icon={<Files className="h-3.5 w-3.5" />}
         label="Bulk queue"
         hint="Drop many PDFs, auto-download each chapter, master bible"
+        disabled={disabled}
+      />
+      <ModeButton
+        active={mode === "tts"}
+        onClick={() => !disabled && onChange("tts")}
+        icon={<Mic className="h-3.5 w-3.5" />}
+        label="TTS"
+        hint="Paste a script, get stitched MP3 + SRT via ai33.pro voices"
         disabled={disabled}
       />
     </div>
