@@ -175,20 +175,16 @@ export function TtsMode() {
   }, [favourites]);
 
   const [customVoiceId, setCustomVoiceId] = useState<string>("");
+  /**
+   * Free-text label the user types for the custom voice ID. We never
+   * gate saving on the API lookup succeeding — many shared / community
+   * voices return 404 from GET /v1/voices but still work fine with the
+   * TTS endpoint. So the name + ID + save button are always visible.
+   */
+  const [customVoiceName, setCustomVoiceName] = useState<string>("");
   const [lookupResult, setLookupResult] = useState<Voice | null>(null);
   const [lookupBusy, setLookupBusy] = useState(false);
   const [lookupError, setLookupError] = useState<string | null>(null);
-  /**
-   * When the API lookup fails with 404 (most commonly a shared /
-   * community voice the user hasn't added to their library), we
-   * offer a "save manually" path — user types their own label and
-   * saves the raw ID to favourites. Re-using the chip from
-   * favourites still uses the ID directly with the TTS endpoint,
-   * which often works for shared voices even when GET /v1/voices
-   * doesn't.
-   */
-  const [showManualSave, setShowManualSave] = useState(false);
-  const [manualSaveName, setManualSaveName] = useState("");
 
   // Favourites operations declared BEFORE lookup/manual-save so the
   // closures over them satisfy temporal-dead-zone strictness.
@@ -226,7 +222,6 @@ export function TtsMode() {
     setLookupBusy(true);
     setLookupError(null);
     setLookupResult(null);
-    setShowManualSave(false);
 
     // Fast path — check if the voice is already in the loaded /v2/voices
     // list (user's own library). Saves an API call + works offline.
@@ -234,6 +229,7 @@ export function TtsMode() {
     if (local) {
       setLookupResult(local);
       updateForm({ voiceId: local.voice_id });
+      if (!customVoiceName.trim()) setCustomVoiceName(local.name);
       setLookupBusy(false);
       return;
     }
@@ -245,43 +241,42 @@ export function TtsMode() {
       );
       setLookupResult(voice);
       updateForm({ voiceId: voice.voice_id });
+      // Auto-fill the name field if the user hasn't already typed one.
+      if (!customVoiceName.trim()) setCustomVoiceName(voice.name);
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
       setLookupError(msg);
-      // 404 = voice exists in ElevenLabs but not in this user's
-      // library (shared / community voices). Offer the manual-save
-      // fallback so they can still use it.
-      if (/404/.test(msg) || /not.?found/i.test(msg)) {
-        setShowManualSave(true);
-        setManualSaveName("");
-      }
+      // 404 / community voice — the save button below still works,
+      // user just needs to type their own label.
     } finally {
       setLookupBusy(false);
     }
-  }, [customVoiceId, apiKey, lastForm.baseUrl, updateForm, voices]);
+  }, [customVoiceId, customVoiceName, apiKey, lastForm.baseUrl, updateForm, voices]);
 
   /**
-   * Save a voice ID to favourites without API confirmation — used
-   * when the user pastes a shared / community voice that isn't in
-   * their library yet. The user types whatever label they want;
-   * we trust them on the ID.
+   * Save the typed (name, ID) pair to favourites. Always available —
+   * no API call required. Trusts the user on the ID, since many shared
+   * voices don't show up in GET /v1/voices but still work with the
+   * TTS endpoint.
    */
-  const manualSave = useCallback(() => {
+  const saveCustom = useCallback(() => {
     const id = customVoiceId.trim();
-    const name = manualSaveName.trim();
+    const name = customVoiceName.trim();
     if (!id || !name) return;
     const synthetic: Voice = {
       voice_id: id,
       name,
-      category: "manual",
+      category: lookupResult?.category ?? "custom",
     };
     saveFavourite(synthetic);
     updateForm({ voiceId: id });
-    setShowManualSave(false);
     setLookupError(null);
     setLookupResult(synthetic);
-    setManualSaveName("");
-  }, [customVoiceId, manualSaveName, saveFavourite, updateForm]);
+  }, [customVoiceId, customVoiceName, lookupResult, saveFavourite, updateForm]);
+
+  const clearAllFavourites = useCallback(() => {
+    setFavourites([]);
+  }, []);
 
   const selectFavourite = useCallback(
     (fav: VoiceFavorite) => {
@@ -623,130 +618,145 @@ export function TtsMode() {
             </div>
           )}
 
-          {/* Custom voice ID lookup — paste any voice_id from
-              ElevenLabs voice library / community voices and use it
-              directly. Lookup fetches metadata + lets you save to
-              favourites for one-click re-use later. */}
+          {/* Custom voice — paste any voice_id (from ElevenLabs voice
+              library, community voices, etc.) + a label of your
+              choosing. Lookup is optional — many shared voices return
+              404 on metadata lookup but still work with the TTS
+              endpoint, so saving is always available. */}
           <div className="rounded border border-zinc-800 bg-zinc-950/40 p-3">
-            <label className="mb-1 block text-xs font-medium text-zinc-400">
+            <label className="mb-2 block text-xs font-medium text-zinc-400">
               <Search className="mr-1 inline h-3 w-3" />
-              Custom voice ID (advanced)
+              Add custom voice (paste ID, give it a name, save)
             </label>
-            <div className="flex items-center gap-2">
-              <input
-                type="text"
-                value={customVoiceId}
-                onChange={(e) => {
-                  setCustomVoiceId(e.target.value);
-                  setLookupResult(null);
-                  setLookupError(null);
-                }}
-                onKeyDown={(e) => {
-                  if (e.key === "Enter") {
-                    e.preventDefault();
-                    lookupVoice();
-                  }
-                }}
-                placeholder="Paste voice_id, e.g. 21m00Tcm4TlvDq8ikWAM"
-                className="flex-1 rounded border border-zinc-700 bg-zinc-950 px-2.5 py-1.5 font-mono text-xs text-zinc-100 placeholder-zinc-600 focus:border-blue-500 focus:outline-none"
-              />
-              <button
-                type="button"
-                onClick={lookupVoice}
-                disabled={lookupBusy || !customVoiceId.trim() || !apiKey.trim()}
-                className="flex h-8 items-center gap-1 rounded bg-blue-600 px-3 text-xs font-semibold text-white hover:bg-blue-500 disabled:cursor-not-allowed disabled:bg-zinc-700"
-              >
-                {lookupBusy ? (
-                  <Loader2 className="h-3 w-3 animate-spin" />
-                ) : (
-                  <Search className="h-3 w-3" />
-                )}
-                Lookup
-              </button>
-            </div>
-            {lookupError && (
-              <div className="mt-2 rounded bg-red-950/40 px-2 py-1 text-[11px] text-red-300">
-                {lookupError}
-                {showManualSave && (
-                  <div className="mt-1 text-amber-300/90">
-                    This voice isn&apos;t in your library — likely a shared /
-                    community voice. You can still save it manually below
-                    and use it directly.
-                  </div>
-                )}
+
+            <div className="space-y-2">
+              {/* Voice name — always visible. */}
+              <div>
+                <label className="mb-1 block text-[10px] font-medium uppercase tracking-wider text-zinc-500">
+                  Voice name (label of your choice)
+                </label>
+                <input
+                  type="text"
+                  value={customVoiceName}
+                  onChange={(e) => setCustomVoiceName(e.target.value)}
+                  placeholder="e.g. Brahma deep narrator"
+                  className="w-full rounded border border-zinc-700 bg-zinc-950 px-2.5 py-1.5 text-xs text-zinc-100 placeholder-zinc-600 focus:border-blue-500 focus:outline-none"
+                />
               </div>
-            )}
-            {showManualSave && (
-              <div className="mt-2 rounded border border-amber-700/40 bg-amber-950/30 p-2.5">
-                <div className="mb-1.5 text-[11px] font-semibold text-amber-200">
-                  Save without lookup
-                </div>
-                <div className="mb-2 text-[10px] text-amber-200/70 leading-relaxed">
-                  Type a label (e.g. &quot;Brahma deep narrator&quot;) and we&apos;ll
-                  save the voice ID to favourites. The TTS endpoint
-                  often works with shared IDs even when lookup doesn&apos;t.
-                </div>
-                <div className="flex items-center gap-2">
-                  <input
-                    type="text"
-                    value={manualSaveName}
-                    onChange={(e) => setManualSaveName(e.target.value)}
-                    onKeyDown={(e) => {
-                      if (e.key === "Enter") {
-                        e.preventDefault();
-                        manualSave();
-                      }
-                    }}
-                    placeholder="Voice label (your choice)"
-                    className="flex-1 rounded border border-zinc-700 bg-zinc-950 px-2 py-1.5 text-xs text-zinc-100 placeholder-zinc-600 focus:border-amber-500 focus:outline-none"
-                  />
-                  <button
-                    type="button"
-                    onClick={manualSave}
-                    disabled={!manualSaveName.trim()}
-                    className="flex h-7 items-center gap-1 rounded bg-amber-600 px-2.5 text-[11px] font-semibold text-white hover:bg-amber-500 disabled:cursor-not-allowed disabled:opacity-50"
-                  >
-                    <Star className="h-3 w-3" />
-                    Save anyway
-                  </button>
-                </div>
+
+              {/* Voice ID — always visible. */}
+              <div>
+                <label className="mb-1 block text-[10px] font-medium uppercase tracking-wider text-zinc-500">
+                  Voice ID
+                </label>
+                <input
+                  type="text"
+                  value={customVoiceId}
+                  onChange={(e) => {
+                    setCustomVoiceId(e.target.value);
+                    setLookupResult(null);
+                    setLookupError(null);
+                  }}
+                  onKeyDown={(e) => {
+                    if (e.key === "Enter") {
+                      e.preventDefault();
+                      saveCustom();
+                    }
+                  }}
+                  placeholder="Paste voice_id, e.g. 21m00Tcm4TlvDq8ikWAM"
+                  className="w-full rounded border border-zinc-700 bg-zinc-950 px-2.5 py-1.5 font-mono text-xs text-zinc-100 placeholder-zinc-600 focus:border-blue-500 focus:outline-none"
+                />
               </div>
-            )}
-            {lookupResult && (
-              <div className="mt-2 flex items-center justify-between gap-2 rounded border border-emerald-700/40 bg-emerald-950/30 px-2 py-1.5">
-                <div className="min-w-0 flex-1">
-                  <div className="text-xs font-semibold text-emerald-200">
-                    ✓ {lookupResult.name}
-                    {lookupResult.category && (
-                      <span className="ml-1 text-[10px] font-normal text-emerald-300/70">
-                        ({lookupResult.category})
-                      </span>
-                    )}
-                  </div>
-                  <code className="text-[10px] text-emerald-300/60">
-                    {lookupResult.voice_id}
-                  </code>
-                </div>
+
+              {/* Save + (optional) Lookup — Save is the primary action. */}
+              <div className="flex flex-wrap items-center gap-2 pt-1">
                 <button
                   type="button"
-                  onClick={() => saveFavourite(lookupResult)}
-                  className="flex items-center gap-1 rounded bg-amber-600 px-2 py-1 text-[11px] font-semibold text-white hover:bg-amber-500"
-                  title="Save to favourites for one-click re-use"
+                  onClick={saveCustom}
+                  disabled={!customVoiceId.trim() || !customVoiceName.trim()}
+                  className="flex h-8 items-center gap-1 rounded bg-amber-600 px-3 text-xs font-semibold text-white hover:bg-amber-500 disabled:cursor-not-allowed disabled:bg-zinc-700 disabled:text-zinc-400"
+                  title="Save to favourites and use as current voice"
                 >
                   <Star className="h-3 w-3" />
                   Save to favourites
                 </button>
+                <button
+                  type="button"
+                  onClick={lookupVoice}
+                  disabled={lookupBusy || !customVoiceId.trim() || !apiKey.trim()}
+                  className="flex h-8 items-center gap-1 rounded border border-zinc-700 bg-zinc-900 px-3 text-xs font-medium text-zinc-300 hover:border-zinc-500 disabled:cursor-not-allowed disabled:opacity-50"
+                  title="Optional — verify the voice exists and auto-fill the name"
+                >
+                  {lookupBusy ? (
+                    <Loader2 className="h-3 w-3 animate-spin" />
+                  ) : (
+                    <Search className="h-3 w-3" />
+                  )}
+                  Verify (optional)
+                </button>
+                <span className="text-[10px] text-zinc-500">
+                  Tip: shared voices often 404 on Verify but still play
+                  via Save.
+                </span>
               </div>
-            )}
+
+              {/* Status — non-blocking. Save remains usable regardless. */}
+              {lookupError && (
+                <div className="rounded bg-red-950/40 px-2 py-1 text-[11px] text-red-300">
+                  Verify failed: {lookupError}
+                  <div className="mt-0.5 text-amber-300/90">
+                    No problem — type a name above and click Save to favourites.
+                  </div>
+                </div>
+              )}
+              {lookupResult && !lookupError && (
+                <div className="rounded border border-emerald-700/40 bg-emerald-950/30 px-2 py-1.5 text-[11px] text-emerald-200">
+                  ✓ Verified: <span className="font-semibold">{lookupResult.name}</span>
+                  {lookupResult.category && (
+                    <span className="ml-1 text-[10px] text-emerald-300/70">
+                      ({lookupResult.category})
+                    </span>
+                  )}
+                </div>
+              )}
+            </div>
           </div>
 
-          {/* Favourites — clickable chips for quick voice switching */}
-          {favourites.length > 0 && (
-            <div>
-              <label className="mb-1.5 block text-xs font-medium text-zinc-400">
-                <Star className="mr-1 inline h-3 w-3 text-amber-400" />
-                Favourites ({favourites.length})
-              </label>
+          {/* Favourites — always-visible prominent card. Shows every
+              custom voice the user has saved (via Save to favourites
+              above) so they can click one to instantly switch voices.
+              When empty, displays a hint pointing back at the save UI. */}
+          <div className="rounded-lg border border-amber-700/30 bg-amber-950/10 p-3">
+            <div className="mb-2 flex items-center justify-between gap-2">
+              <div className="flex items-center gap-1.5 text-sm font-semibold text-amber-200">
+                <Star className="h-4 w-4 fill-amber-400 text-amber-400" />
+                Favourites
+                <span className="text-[11px] font-normal text-amber-300/70">
+                  ({favourites.length})
+                </span>
+              </div>
+              {favourites.length > 0 && (
+                <button
+                  type="button"
+                  onClick={clearAllFavourites}
+                  className="text-[10px] text-zinc-500 underline hover:text-red-400"
+                  title="Remove all saved favourites"
+                >
+                  Clear all
+                </button>
+              )}
+            </div>
+
+            {favourites.length === 0 ? (
+              <div className="rounded border border-dashed border-zinc-700 bg-zinc-950/40 px-3 py-4 text-center text-[11px] text-zinc-500">
+                No favourites yet. Paste a voice ID above, give it a
+                name, and click{" "}
+                <span className="font-semibold text-amber-300">
+                  Save to favourites
+                </span>{" "}
+                — it will appear here for one-click re-use.
+              </div>
+            ) : (
               <div className="flex flex-wrap gap-1.5">
                 {favourites.map((fav) => {
                   const isActive = lastForm.voiceId === fav.voice_id;
@@ -779,7 +789,7 @@ export function TtsMode() {
                       <button
                         type="button"
                         onClick={() => removeFavourite(fav.voice_id)}
-                        className="opacity-0 transition group-hover:opacity-100"
+                        className="opacity-60 transition hover:opacity-100 group-hover:opacity-100"
                         title="Remove from favourites"
                       >
                         <Trash2 className="h-2.5 w-2.5 text-zinc-500 hover:text-red-400" />
@@ -788,8 +798,8 @@ export function TtsMode() {
                   );
                 })}
               </div>
-            </div>
-          )}
+            )}
+          </div>
 
           {/* Model picker — all 6 ElevenLabs models with descriptions */}
           <div>
