@@ -74,6 +74,7 @@ import type {
 } from "../types/manhwa";
 import type { KeyRotator } from "./keyRotator";
 import { debugLog } from "./debugLog";
+import { acquireKeepAwake, type KeepAwakeHandle } from "./keepAwake";
 
 export interface BulkProgressUpdate {
   itemIndex: number;
@@ -244,6 +245,23 @@ export async function runBulkQueue(
     appendToSeriesId,
     pauseController,
   } = opts;
+
+  // Acquire wake lock + silent audio keepalive for the duration of
+  // this run. Released in the finally block at the very end. Both
+  // mechanisms together keep the tab at near-foreground priority
+  // even when the user switches tabs, so bulk runs don't slow to a
+  // crawl when they go check Slack mid-job.
+  const keepAwake: KeepAwakeHandle = await acquireKeepAwake();
+  debugLog.push({
+    type: "info",
+    label: `Keep-awake activated for bulk run`,
+    context: {
+      wakeLock: keepAwake.wakeLockAcquired,
+      silentAudio: keepAwake.silentAudioActive,
+    },
+  });
+
+  try {
 
   let masterBible = loadMasterBible();
 
@@ -1180,6 +1198,17 @@ export async function runBulkQueue(
       // Release Blob references so the browser can GC them.
       accumulated.length = 0;
     }
+  }
+
+  } finally {
+    // Release wake lock + stop silent audio. Pairs with the
+    // acquireKeepAwake() call at the top of runBulkQueue. Runs on
+    // both success AND error paths.
+    await keepAwake.release();
+    debugLog.push({
+      type: "info",
+      label: "Keep-awake released — bulk run complete",
+    });
   }
 }
 

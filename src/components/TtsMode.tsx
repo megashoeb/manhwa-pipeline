@@ -48,6 +48,7 @@ import {
 } from "../core/voiceAudioStitcher";
 import { buildSrt } from "../core/voiceSrtBuilder";
 import { readJson, writeJson } from "../core/storage";
+import { acquireKeepAwake } from "../core/keepAwake";
 
 const STORAGE_KEY_API = "manhwa.tts.apiKey";
 const STORAGE_KEY_FORM = "manhwa.tts.lastForm";
@@ -834,6 +835,15 @@ export function TtsMode() {
     const audioUrls: (string | null)[] = new Array(lines.length).fill(null);
     const allIndices = Array.from({ length: lines.length }, (_, i) => i);
 
+    // Wake lock + silent audio keepalive — keeps the browser tab at
+    // near-foreground priority even when the user switches tabs.
+    // Without this, a 600-line script that takes 8 min foreground
+    // can balloon to 40+ min if the user tabs away mid-run.
+    const keepAwake = await acquireKeepAwake();
+    appendLog(
+      `Keep-awake activated (wake-lock: ${keepAwake.wakeLockAcquired}, silent-audio: ${keepAwake.silentAudioActive}) — tab will stay fast in background.`,
+    );
+
     try {
       const failedIndices = await runWorkerPool(
         config,
@@ -868,6 +878,7 @@ export function TtsMode() {
         `FATAL: ${err instanceof Error ? err.message : String(err)}`,
       );
     } finally {
+      await keepAwake.release();
       setBusy(false);
       abortRef.current = null;
     }
