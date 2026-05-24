@@ -1024,46 +1024,85 @@ export async function runBulkQueue(
       total: totalBridges,
       message: `Stitching ${totalBridges} chapter bridge${totalBridges === 1 ? "" : "s"}…`,
     });
-    for (let b = 0; b < totalBridges; b++) {
-      if (abortSignal.aborted) break;
-      const prevEntry = orderedEntries[b];
-      const currEntry = orderedEntries[b + 1];
-      const prevLines = prevEntry.script.lines;
-      const currLines = currEntry.script.lines;
-      if (prevLines.length === 0 || currLines.length === 0) continue;
+    // Parallel worker pool — bridges are independent (each one looks
+    // at its own prev/curr chapter pair, no shared state), so we can
+    // generate up to BRIDGE_CONCURRENCY at once. For 79 bridges this
+    // drops the wall-clock from ~8-13 min sequential to ~1.5-2.5 min.
+    const BRIDGE_CONCURRENCY = 5;
+    const bridgeStartedAt = Date.now();
+    debugLog.push({
+      type: "stage-start",
+      label: "bridges (parallel pool)",
+      context: { count: totalBridges, concurrency: BRIDGE_CONCURRENCY },
+    });
 
-      const lastBeat = prevLines[prevLines.length - 1];
-      const firstBeat = currLines[0];
+    let bridgeCursor = 0;
+    let bridgesDone = 0;
+    const claimBridge = (): number => {
+      if (abortSignal.aborted) return -1;
+      if (bridgeCursor >= totalBridges) return -1;
+      return bridgeCursor++;
+    };
 
-      const bridge = await generateBridgeSentence(lastBeat, firstBeat, {
-        model,
-        rotator,
-        onKeyUsed,
-      });
-      if (bridge) {
-        // Prepend bridge to first paragraph of the next chapter. Keeps
-        // paragraph count unchanged — viewer hears bridge + first beat
-        // as one paragraph, no SRT slot drift.
-        currLines[0] = `${bridge} ${firstBeat}`;
-        currEntry.script.scriptText = currLines.join("\n");
-        // Also reflect into the scene the line came from so downstream
-        // ``scenes[i].lines`` stays consistent with ``lines``.
-        const firstScene = currEntry.script.scenes[0];
-        if (firstScene && firstScene.lines.length > 0) {
-          firstScene.lines[0] = currLines[0];
+    const bridgeWorker = async (): Promise<void> => {
+      while (true) {
+        const b = claimBridge();
+        if (b === -1) return;
+        const prevEntry = orderedEntries[b];
+        const currEntry = orderedEntries[b + 1];
+        const prevLines = prevEntry.script.lines;
+        const currLines = currEntry.script.lines;
+        if (prevLines.length === 0 || currLines.length === 0) {
+          bridgesDone++;
+          continue;
         }
+
+        const lastBeat = prevLines[prevLines.length - 1];
+        const firstBeat = currLines[0];
+
+        const bridge = await generateBridgeSentence(lastBeat, firstBeat, {
+          model,
+          rotator,
+          onKeyUsed,
+        });
+        if (bridge) {
+          // Prepend bridge to first paragraph of the next chapter.
+          // Keeps paragraph count unchanged — viewer hears bridge +
+          // first beat as one paragraph, no SRT slot drift.
+          currLines[0] = `${bridge} ${firstBeat}`;
+          currEntry.script.scriptText = currLines.join("\n");
+          const firstScene = currEntry.script.scenes[0];
+          if (firstScene && firstScene.lines.length > 0) {
+            firstScene.lines[0] = currLines[0];
+          }
+        }
+        bridgesDone++;
+        onProgress({
+          itemIndex: -1,
+          stage: "bridging",
+          current: bridgesDone,
+          total: totalBridges,
+          message:
+            bridge.length > 0
+              ? `Bridged chapter ${prevEntry.chapterIndex} → ${currEntry.chapterIndex}`
+              : `Bridge skipped for chapter ${prevEntry.chapterIndex} → ${currEntry.chapterIndex}`,
+        });
       }
-      onProgress({
-        itemIndex: -1,
-        stage: "bridging",
-        current: b + 1,
-        total: totalBridges,
-        message:
-          bridge.length > 0
-            ? `Bridged chapter ${prevEntry.chapterIndex} → ${currEntry.chapterIndex}`
-            : `Bridge skipped for chapter ${prevEntry.chapterIndex} → ${currEntry.chapterIndex}`,
-      });
-    }
+    };
+
+    await Promise.all(
+      Array.from(
+        { length: Math.min(BRIDGE_CONCURRENCY, totalBridges) },
+        () => bridgeWorker(),
+      ),
+    );
+
+    debugLog.push({
+      type: "stage-end",
+      label: "bridges (parallel pool)",
+      durationMs: Date.now() - bridgeStartedAt,
+      context: { count: totalBridges },
+    });
   }
 
   // Build the combined ZIP whenever ANY chapter succeeded — even if

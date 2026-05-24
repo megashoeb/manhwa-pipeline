@@ -36,8 +36,10 @@ interface OpenRouterRequest {
   top_p?: number;
   /** Set when caller asks for JSON-mode structured output. */
   response_format?: { type: "json_object" };
-  /** Optional max tokens hint. */
+  /** Optional max tokens hint (legacy OpenAI). */
   max_tokens?: number;
+  /** Newer OpenAI-style cap, also accepted by some Qwen routes. */
+  max_completion_tokens?: number;
 }
 
 interface OpenRouterResponse {
@@ -290,11 +292,17 @@ export async function callOpenRouter(
   }
   if (opts.topP != null) body.top_p = opts.topP;
   // Cap output tokens — without this, Qwen sometimes runs to its full
-  // 65K-token output limit on a script that should be 2K tokens. The
-  // wasted tokens cost you money + the request takes 10× longer +
-  // truncated JSON corrupts parsing. 8K is plenty for any single
-  // pipeline stage's structured output.
-  body.max_tokens = body.max_tokens ?? 8192;
+  // 65K-token output limit even on prompts that should produce ~2K
+  // tokens. We set BOTH ``max_tokens`` (OpenAI legacy) and
+  // ``max_completion_tokens`` (newer spec) — different OpenRouter
+  // upstream providers respect different ones, and Qwen3.5-Flash via
+  // Alibaba was observed ignoring max_tokens (a 14,563-token output
+  // came back when max_tokens=8192). Setting both fixes the runaway.
+  // 6K is enough for whole-chapter narration; structured output
+  // stages (curator, segment) need way less.
+  const cap = body.max_tokens ?? 6144;
+  body.max_tokens = cap;
+  body.max_completion_tokens = cap;
 
   opts.onKeyUsed?.(maskKey(apiKey));
 
