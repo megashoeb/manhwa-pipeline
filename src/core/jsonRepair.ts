@@ -15,6 +15,8 @@
 // Gemini's output is much cleaner, but Gemini calls also benefit from
 // the repair pass — saves the occasional retry there too.
 
+import { debugLog } from "./debugLog";
+
 /**
  * Parse LLM-generated JSON with graceful recovery. Tries strict
  * ``JSON.parse`` first, then progressively more aggressive repair
@@ -35,7 +37,9 @@ export function safeJsonParse<T = unknown>(
   // FAST PATH: try strict parse on the cleaned text first. Covers the
   // ~97% case where the model gave us valid JSON.
   try {
-    return JSON.parse(cleaned) as T;
+    const r = JSON.parse(cleaned) as T;
+    debugLog.push({ type: "parse-success", label: "JSON parse (strict)" });
+    return r;
   } catch {
     /* fall through to recovery */
   }
@@ -49,7 +53,13 @@ export function safeJsonParse<T = unknown>(
 
   // Try parse on the extracted block.
   try {
-    return JSON.parse(extracted) as T;
+    const r = JSON.parse(extracted) as T;
+    debugLog.push({
+      type: "parse-repair",
+      label: "JSON parse (after extracting balanced block)",
+      detail: raw.slice(0, 200),
+    });
+    return r;
   } catch {
     /* fall through to repair */
   }
@@ -57,13 +67,30 @@ export function safeJsonParse<T = unknown>(
   // Apply increasingly aggressive repairs.
   const repaired = repairJson(extracted);
   try {
-    return JSON.parse(repaired) as T;
+    const r = JSON.parse(repaired) as T;
+    debugLog.push({
+      type: "parse-repair",
+      label: "JSON parse (after repair: smart quotes / trailing commas / etc)",
+      detail: raw.slice(0, 200),
+    });
+    return r;
   } catch (err) {
     // Final attempt: balance brackets in case the model was truncated.
     const balanced = balanceBrackets(repaired);
     try {
-      return JSON.parse(balanced) as T;
+      const r = JSON.parse(balanced) as T;
+      debugLog.push({
+        type: "parse-repair",
+        label: "JSON parse (after bracket balancing — output was truncated)",
+        detail: raw.slice(0, 200),
+      });
+      return r;
     } catch {
+      debugLog.push({
+        type: "parse-fail",
+        label: "JSON parse failed after all repair attempts",
+        detail: `Error: ${(err as Error).message}\nRaw start: ${raw.slice(0, 400)}`,
+      });
       throw new Error(
         `JSON parse failed after all repair attempts: ${(err as Error).message}. ` +
           `Raw start: ${raw.slice(0, 120)}`,

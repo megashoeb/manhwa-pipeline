@@ -18,6 +18,7 @@ import { ApiKeyManager } from "./components/ApiKeyManager";
 import { ScriptOutput } from "./components/ScriptOutput";
 import { BulkMode } from "./components/BulkMode";
 import { TtsMode } from "./components/TtsMode";
+import { DebugPanel } from "./components/DebugPanel";
 
 import {
   extractPdfPages,
@@ -281,6 +282,7 @@ function App() {
       </main>
 
       <Footer />
+      <DebugPanel />
     </div>
   );
 }

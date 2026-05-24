@@ -73,6 +73,7 @@ import type {
   QueueItem,
 } from "../types/manhwa";
 import type { KeyRotator } from "./keyRotator";
+import { debugLog } from "./debugLog";
 
 export interface BulkProgressUpdate {
   itemIndex: number;
@@ -596,6 +597,12 @@ export async function runBulkQueue(
       // stale promises indefinitely.
       pageCache.delete(i);
       timing.extract_ms = extractTimer();
+      debugLog.push({
+        type: "stage-end",
+        label: "extract PDF",
+        durationMs: timing.extract_ms,
+        context: { chapter: i + 1, pages: pages.length },
+      });
 
       // ---- Stage 2: filter (crop + blank + phash) -------------------
       onItemUpdate(i, { stage: "filtering" });
@@ -613,6 +620,12 @@ export async function runBulkQueue(
           }),
       );
       timing.filter_ms = filterTimer();
+      debugLog.push({
+        type: "stage-end",
+        label: "filter pipeline",
+        durationMs: timing.filter_ms,
+        context: { chapter: i + 1, kept: filterResult.stats.kept },
+      });
 
       // ---- Stage 3: generate script (with master bible as context) -
       onItemUpdate(i, {
@@ -766,6 +779,21 @@ export async function runBulkQueue(
           console.log(
             `[CHAPTER ${i + 1} TIMING] ${file.name}: ${formatTiming(timing)}`,
           );
+          debugLog.push({
+            type: "stage-end",
+            label: "chapter (total)",
+            durationMs: timing.total_ms,
+            context: {
+              chapter: i + 1,
+              extract: timing.extract_ms,
+              filter: timing.filter_ms,
+              bible: timing.bible_ms,
+              classify: timing.classify_ms,
+              comprehend: timing.comprehend_ms,
+              segment: timing.segment_ms,
+              polish: timing.polish_ms,
+            },
+          });
           accumulated[i] = {
             chapterIndex: i + 1,
             chapterName: file.name.replace(/\.pdf$/i, ""),

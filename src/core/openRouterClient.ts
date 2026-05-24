@@ -11,6 +11,7 @@
 // Same retry logic, same image handling, same JSON-mode support.
 
 import type { KeyRotator } from "./keyRotator";
+import { debugLog } from "./debugLog";
 
 const ENDPOINT = "https://openrouter.ai/api/v1/chat/completions";
 
@@ -187,6 +188,17 @@ export async function callOpenRouter(
 
   let lastErr: unknown = null;
   for (let attempt = 0; attempt < MAX_ATTEMPTS; attempt++) {
+    const callStartedAt = Date.now();
+    debugLog.push({
+      type: "api-call",
+      label: `openrouter ${opts.model}`,
+      context: {
+        attempt: attempt + 1,
+        jsonMode: body.response_format != null,
+        imageCount: opts.images?.length ?? 0,
+        key: maskKey(apiKey),
+      },
+    });
     const ctrl = new AbortController();
     const timeoutHandle = window.setTimeout(
       () =>
@@ -267,6 +279,13 @@ export async function callOpenRouter(
       } catch {
         /* ignore */
       }
+      debugLog.push({
+        type: "api-error",
+        label: `openrouter ${opts.model} → HTTP ${response.status}`,
+        durationMs: Date.now() - callStartedAt,
+        context: { status: response.status, attempt: attempt + 1 },
+        detail: detail.slice(0, 600),
+      });
       throw new OpenRouterError(
         `OpenRouter HTTP ${response.status}: ${detail.slice(0, 200) || response.statusText}`,
         response.status,
@@ -279,6 +298,13 @@ export async function callOpenRouter(
     rotator.recordSuccess(apiKey);
 
     if (data.error) {
+      debugLog.push({
+        type: "api-error",
+        label: `openrouter ${opts.model} → ${data.error.message || "error"}`,
+        durationMs: Date.now() - callStartedAt,
+        context: { code: data.error.code, attempt: attempt + 1 },
+        detail: JSON.stringify(data.error).slice(0, 600),
+      });
       throw new OpenRouterError(
         `OpenRouter error: ${data.error.message || "unknown"}`,
         typeof data.error.code === "number" ? data.error.code : 0,
@@ -301,6 +327,16 @@ export async function callOpenRouter(
         JSON.stringify(data).slice(0, 800),
       );
     }
+    debugLog.push({
+      type: "api-success",
+      label: `openrouter ${opts.model}`,
+      durationMs: Date.now() - callStartedAt,
+      context: {
+        inputTokens: data.usage?.prompt_tokens,
+        outputTokens: data.usage?.completion_tokens,
+        attempt: attempt + 1,
+      },
+    });
     return text;
   }
 
