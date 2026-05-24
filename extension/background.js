@@ -92,7 +92,58 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
 // (in the popup log) which build is actually running — the
 // chrome://extensions/ page sometimes caches the manifest version
 // even after a reload, so an in-log marker is the only reliable signal.
-const EXTENSION_BUILD = "v1.4.3 batch-bypass";
+const EXTENSION_BUILD = "v1.4.4 cors-inject";
+
+// On startup, install a declarativeNetRequest rule that injects
+// ``Access-Control-Allow-Origin: *`` into every image response. This
+// is the key to making cross-origin canvas reads work from the
+// bypass tab — without it, even loading an image with
+// ``<img crossOrigin="anonymous">`` taints the canvas because the
+// image CDN doesn't natively send CORS headers (image CDNs serve
+// via ``<img>`` tags which don't need CORS, so most don't bother).
+// With the injected header, browsers treat the image as CORS-OK and
+// ``canvas.toBlob()`` succeeds.
+//
+// We register on every SW boot — chrome.declarativeNetRequest dedupes
+// by rule id so this is safe to call repeatedly.
+async function installCorsInjectionRules() {
+  try {
+    await chrome.declarativeNetRequest.updateDynamicRules({
+      removeRuleIds: [1001],
+      addRules: [
+        {
+          id: 1001,
+          priority: 1,
+          action: {
+            type: "modifyHeaders",
+            responseHeaders: [
+              {
+                header: "access-control-allow-origin",
+                operation: "set",
+                value: "*",
+              },
+            ],
+          },
+          condition: {
+            // Apply to every host (we have ``<all_urls>`` host
+            // permission). resourceTypes restricts the rule to the
+            // request types we actually care about, so we don't
+            // affect navigation / script loads.
+            resourceTypes: ["image", "xmlhttprequest"],
+          },
+        },
+      ],
+    });
+  } catch (err) {
+    // Most likely cause: extension lacks declarativeNetRequest
+    // permission (unlikely since manifest declares it). Log and
+    // continue — image fetch will fall back to fetch() which may
+    // still work for non-CORS-protected CDNs.
+    console.warn("[manhwa-ext] CORS rule install failed:", err);
+  }
+}
+// Run on import (SW startup).
+installCorsInjectionRules();
 
 async function startJob(payload) {
   const {
@@ -903,8 +954,97 @@ async function fetchAllImagesViaBypassTab(imageUrls) {
       target: { tabId: bypassTabId },
       args: [imageUrls],
       func: async (urls) => {
-        // Cap concurrency at 6 — too many parallel fetches against a
-        // single CDN host can trigger rate-limit shedding.
+        // STRATEGY: For each URL, try in order:
+        //   1. ``<img crossOrigin="anonymous">`` + canvas — image
+        //      tags are CORS-exempt for loading but CORS-required
+        //      for canvas reads. The CORS-header inject rule the
+        //      background SW installed makes this work.
+        //   2. ``fetch()`` — fallback for cases where the image tag
+        //      path failed (e.g., CDN serves something that isn't
+        //      decodable as an image).
+        //
+        // Both run inside the chapter page's context so the request
+        // carries the page's session: cookies (cf_clearance),
+        // Referer, TLS fingerprint — everything a CDN's hotlinking
+        // check expects to see.
+
+        function loadImageToBlob(url) {
+          return new Promise((resolve, reject) => {
+            const img = new Image();
+            img.crossOrigin = "anonymous";
+            const timer = setTimeout(() => {
+              reject(new Error("image load timeout"));
+            }, 30000);
+            img.onload = () => {
+              clearTimeout(timer);
+              try {
+                const canvas = document.createElement("canvas");
+                canvas.width = img.naturalWidth;
+                canvas.height = img.naturalHeight;
+                if (canvas.width === 0 || canvas.height === 0) {
+                  reject(new Error("zero-sized image"));
+                  return;
+                }
+                const ctx = canvas.getContext("2d");
+                ctx.drawImage(img, 0, 0);
+                canvas.toBlob(
+                  (blob) => {
+                    if (!blob) {
+                      reject(new Error("toBlob null (canvas tainted?)"));
+                      return;
+                    }
+                    resolve(blob);
+                  },
+                  "image/jpeg",
+                  0.9,
+                );
+              } catch (err) {
+                reject(err);
+              }
+            };
+            img.onerror = () => {
+              clearTimeout(timer);
+              reject(new Error("img load error (CORS rejection or 4xx)"));
+            };
+            img.src = url;
+          });
+        }
+
+        async function tryFetch(url) {
+          const r = await fetch(url, { credentials: "include" });
+          if (!r.ok) throw new Error(`HTTP ${r.status}`);
+          return await r.blob();
+        }
+
+        async function blobToBase64(blob) {
+          const buf = await blob.arrayBuffer();
+          const bytes = new Uint8Array(buf);
+          let bin = "";
+          const chunk = 0x8000;
+          for (let i = 0; i < bytes.length; i += chunk) {
+            bin += String.fromCharCode.apply(null, bytes.subarray(i, i + chunk));
+          }
+          return { base64: btoa(bin), type: blob.type || "image/jpeg" };
+        }
+
+        async function getOne(url) {
+          // Try image tag → canvas first (most reliable for CDNs).
+          try {
+            const blob = await loadImageToBlob(url);
+            return await blobToBase64(blob);
+          } catch (e1) {
+            // Fallback to fetch.
+            try {
+              const blob = await tryFetch(url);
+              return await blobToBase64(blob);
+            } catch (e2) {
+              return {
+                error: `img: ${e1?.message || e1}; fetch: ${e2?.message || e2}`,
+              };
+            }
+          }
+        }
+
         const PARALLEL = 6;
         const out = new Array(urls.length);
         let cursor = 0;
@@ -912,28 +1052,7 @@ async function fetchAllImagesViaBypassTab(imageUrls) {
           while (true) {
             const i = cursor++;
             if (i >= urls.length) return;
-            const url = urls[i];
-            try {
-              const r = await fetch(url, { credentials: "include" });
-              if (!r.ok) {
-                out[i] = { error: `HTTP ${r.status}` };
-                continue;
-              }
-              const blob = await r.blob();
-              const buf = await blob.arrayBuffer();
-              const bytes = new Uint8Array(buf);
-              let bin = "";
-              const chunk = 0x8000;
-              for (let j = 0; j < bytes.length; j += chunk) {
-                bin += String.fromCharCode.apply(null, bytes.subarray(j, j + chunk));
-              }
-              out[i] = {
-                base64: btoa(bin),
-                type: blob.type || "image/jpeg",
-              };
-            } catch (err) {
-              out[i] = { error: String(err?.message || err) };
-            }
+            out[i] = await getOne(urls[i]);
           }
         }
         await Promise.all(
