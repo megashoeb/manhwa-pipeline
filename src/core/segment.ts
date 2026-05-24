@@ -27,6 +27,7 @@ import type { KeyRotator } from "./keyRotator";
 
 import { generateContent } from "./geminiClient";
 import { downscaleBlobs } from "./imageDownscale";
+import { tryJsonParse } from "./jsonRepair";
 
 export interface SegmentOptions {
   model: string;
@@ -211,22 +212,11 @@ async function callSegment(
  * error — caller treats empty as "trigger retry / fallback".
  */
 function parseBeatsArray(raw: string): string[] {
-  let cleaned = raw
-    .trim()
-    .replace(/^```(?:json|JSON)?\s*\n?/, "")
-    .replace(/\n?\s*```\s*$/, "")
-    .trim();
-
-  const arrStart = cleaned.indexOf("[");
-  if (arrStart === -1) return [];
-  cleaned = extractBalancedArray(cleaned.slice(arrStart));
-
-  let arr: unknown;
-  try {
-    arr = JSON.parse(cleaned);
-  } catch {
-    return [];
-  }
+  // Tolerant parser — handles Qwen's ~3% structured-output error rate
+  // (smart quotes, trailing commas, truncation) without needing a
+  // chapter-level retry. Returns [] only when the output is truly
+  // unparseable; caller treats that as "retry / fallback".
+  const arr = tryJsonParse<unknown>(raw, "array");
   if (!Array.isArray(arr)) return [];
 
   return arr.map((x) =>
@@ -234,35 +224,7 @@ function parseBeatsArray(raw: string): string[] {
   );
 }
 
-/** Extract the first balanced ``[...]`` block; handles strings + escapes. */
-function extractBalancedArray(s: string): string {
-  if (!s.startsWith("[")) return s;
-  let depth = 0;
-  let inString = false;
-  let escape = false;
-  for (let i = 0; i < s.length; i++) {
-    const c = s[i];
-    if (escape) {
-      escape = false;
-      continue;
-    }
-    if (c === "\\") {
-      escape = true;
-      continue;
-    }
-    if (c === '"') {
-      inString = !inString;
-      continue;
-    }
-    if (inString) continue;
-    if (c === "[") depth++;
-    else if (c === "]") {
-      depth--;
-      if (depth === 0) return s.slice(0, i + 1);
-    }
-  }
-  return s;
-}
+// (extractBalancedArray moved to ./jsonRepair as part of safeJsonParse.)
 
 /**
  * Last-resort: split prose into ``n`` roughly-equal chunks by sentence

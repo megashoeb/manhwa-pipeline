@@ -11,6 +11,7 @@
 import type { CharacterBible, FilteredPage } from "../types/manhwa";
 import type { KeyRotator } from "./keyRotator";
 import { generateContent } from "./geminiClient";
+import { safeJsonParse } from "./jsonRepair";
 
 // Sized to comfortably include mid-chapter reveals (e.g. "the hooded
 // figure IS Ghislain") without blowing past Gemini's 20MB inline-data
@@ -59,14 +60,14 @@ export async function extractCharacterBible(
     onKeyUsed,
   });
 
-  // Gemini occasionally violates ``responseMimeType: application/json``
-  // and either wraps the JSON in ```json fences``` or appends commentary
-  // after the closing brace. Strict ``JSON.parse(raw)`` fails on either.
-  // We pull out the first balanced ``{...}`` block and parse that.
+  // Tolerant JSON parse — handles Qwen / Gemini quirks: code fences,
+  // commentary, trailing commas, smart quotes, truncated output.
+  // Avoids unnecessary chapter-level retries (each retry = 30s-3min
+  // wasted on the same 3% of corrupt-output cases that a repair pass
+  // would have fixed in microseconds).
   let parsed: Record<string, unknown>;
-  const extracted = extractFirstJsonObject(raw);
   try {
-    parsed = JSON.parse(extracted) as Record<string, unknown>;
+    parsed = safeJsonParse<Record<string, unknown>>(raw, "object");
   } catch (e) {
     throw new Error(
       `Bible response was not valid JSON: ${(e as Error).message}\n` +
@@ -162,57 +163,8 @@ CRITICAL rules for title_page_indices:
 - When in doubt, do NOT flag — keeping a borderline page produces 1 extra narration line, removing a real story page loses information.`;
 }
 
-/**
- * Pull the first balanced ``{...}`` block out of Gemini's raw response.
- *
- * Tolerant of:
- *   • Markdown code fences (```json ... ```)
- *   • Leading commentary ("Here is the JSON:" etc.)
- *   • Trailing commentary or a second JSON appended after the first
- *   • Strings containing braces (we track quote state + backslash escapes)
- *
- * Falls back to the trimmed raw string when no ``{`` is found, so the
- * caller's JSON.parse can produce a sensible error message.
- */
-function extractFirstJsonObject(raw: string): string {
-  // Strip a leading markdown fence (with or without "json" language tag)
-  // and any closing fence at the very end.
-  const cleaned = raw
-    .trim()
-    .replace(/^```(?:json|JSON)?\s*\n?/, "")
-    .replace(/\n?\s*```\s*$/, "")
-    .trim();
-
-  const start = cleaned.indexOf("{");
-  if (start === -1) return cleaned;
-
-  let depth = 0;
-  let inString = false;
-  let escape = false;
-  for (let i = start; i < cleaned.length; i++) {
-    const c = cleaned[i];
-    if (escape) {
-      escape = false;
-      continue;
-    }
-    if (c === "\\") {
-      escape = true;
-      continue;
-    }
-    if (c === '"') {
-      inString = !inString;
-      continue;
-    }
-    if (inString) continue;
-    if (c === "{") depth++;
-    else if (c === "}") {
-      depth--;
-      if (depth === 0) return cleaned.slice(start, i + 1);
-    }
-  }
-  // Unclosed — let JSON.parse fail with the right error context.
-  return cleaned.slice(start);
-}
+// (extractFirstJsonObject moved to ./jsonRepair as part of safeJsonParse —
+//  the shared module handles fences, balancing, AND structural repair.)
 
 /** Compact text rendering of the previous bible for the prompt. */
 function buildPreviousContext(prev: CharacterBible): string {

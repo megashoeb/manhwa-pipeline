@@ -25,6 +25,7 @@ import type { KeyRotator } from "./keyRotator";
 
 import { generateContent } from "./geminiClient";
 import { downscaleBlobs } from "./imageDownscale";
+import { tryJsonParse } from "./jsonRepair";
 
 /**
  * Minimum panels to keep per chapter. 15 = floor for story-first
@@ -444,24 +445,10 @@ function dropBatch(size: number): PanelScore[] {
  * the batch entirely.
  */
 function parseScoreArray(raw: string, _expected: number): PanelScore[] {
-  // Strip markdown fences and leading commentary.
-  let cleaned = raw
-    .trim()
-    .replace(/^```(?:json|JSON)?\s*\n?/, "")
-    .replace(/\n?\s*```\s*$/, "")
-    .trim();
-  // Find the first ``[`` that begins an array.
-  const arrStart = cleaned.indexOf("[");
-  if (arrStart === -1) return [];
-  // Match balanced brackets to extract just the array.
-  cleaned = extractBalancedArray(cleaned.slice(arrStart));
-
-  let arr: unknown;
-  try {
-    arr = JSON.parse(cleaned);
-  } catch {
-    return [];
-  }
+  // Tolerant parse — handles common LLM output corruption (smart
+  // quotes, trailing commas, truncated arrays). Returns [] only when
+  // the response is genuinely unrecoverable; caller drops the batch.
+  const arr = tryJsonParse<unknown>(raw, "array");
   if (!Array.isArray(arr)) return [];
 
   // Return EXACTLY arr.length scores. No truncation, no padding —
@@ -494,35 +481,7 @@ function parseScoreArray(raw: string, _expected: number): PanelScore[] {
   return out;
 }
 
-/** Extract the first balanced ``[...]`` block; handles strings + escapes. */
-function extractBalancedArray(s: string): string {
-  if (!s.startsWith("[")) return s;
-  let depth = 0;
-  let inString = false;
-  let escape = false;
-  for (let i = 0; i < s.length; i++) {
-    const c = s[i];
-    if (escape) {
-      escape = false;
-      continue;
-    }
-    if (c === "\\") {
-      escape = true;
-      continue;
-    }
-    if (c === '"') {
-      inString = !inString;
-      continue;
-    }
-    if (inString) continue;
-    if (c === "[") depth++;
-    else if (c === "]") {
-      depth--;
-      if (depth === 0) return s.slice(0, i + 1);
-    }
-  }
-  return s;
-}
+// (extractBalancedArray moved to ./jsonRepair as part of safeJsonParse.)
 
 function clamp01to10(v: unknown): number {
   const n = typeof v === "number" ? v : Number(v);

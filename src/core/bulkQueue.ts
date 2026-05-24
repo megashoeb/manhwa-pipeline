@@ -459,7 +459,11 @@ export async function runBulkQueue(
   // recoverable failures: 429 rate limit cascades, 503 model
   // overload, network timeouts caught by geminiClient's 180s
   // AbortController, JSON parse failures from a flaky response.
-  const CHAPTER_RETRY_BACKOFFS_MS = [30_000, 90_000, 180_000];
+  // Aggressive backoffs (was 30s/90s/180s = up to 5 min wasted per
+  // failed chapter). With OpenRouter paid + Qwen3.5-Flash + the
+  // jsonRepair layer, most failures are now transient network blips
+  // that clear within seconds, not provider quota exhaustion.
+  const CHAPTER_RETRY_BACKOFFS_MS = [5_000, 15_000, 30_000];
   const CHAPTER_MAX_ATTEMPTS = CHAPTER_RETRY_BACKOFFS_MS.length + 1;
   const processChapter = async (i: number): Promise<void> => {
     // Skip chapters already loaded from a resumed session's checkpoints.

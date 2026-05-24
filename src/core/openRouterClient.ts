@@ -70,14 +70,21 @@ export class OpenRouterError extends Error {
 /** HTTP statuses that mean "try again in a moment" — same as Gemini. */
 const SERVER_ERROR_STATUSES = new Set([500, 502, 503, 504]);
 
-const MAX_ATTEMPTS = 4;
-const REQUEST_TIMEOUT_MS = 180_000;
+// Tuned for paid OpenRouter on Qwen3.5-Flash: the rare server-side
+// error usually clears within a couple of seconds (Alibaba CN routes
+// can briefly drop). 2 attempts × short backoff = ~3s max retry
+// overhead vs the old 4 × exponential which capped at 31.5s.
+// Combined with the JSON-repair layer in jsonRepair.ts, most "errors"
+// don't reach this retry loop at all — they get fixed inline.
+const MAX_ATTEMPTS = 2;
+const REQUEST_TIMEOUT_MS = 120_000;
 
 function backoffMs(attempt: number): number {
-  // 1.5s, 3s, 6s, 12s — capped at 20s. Mirrors geminiClient's gentle
-  // retry profile (tuned for speed after the user's "10 min/chapter"
-  // complaint).
-  return Math.min(20_000, 1_500 * 2 ** attempt);
+  // 1s, 2s — quick recovery, no exponential ramp. If a provider is
+  // genuinely down a 12s wait wouldn't help anyway (waste the user's
+  // time); better to fail fast and let the chapter-level retry handle
+  // longer outages.
+  return [1_000, 2_000][attempt] ?? 2_000;
 }
 
 function sleep(ms: number): Promise<void> {
@@ -158,11 +165,23 @@ export async function callOpenRouter(
     model: opts.model,
     messages,
   };
-  if (opts.temperature != null) body.temperature = opts.temperature;
-  if (opts.topP != null) body.top_p = opts.topP;
   if (opts.responseMimeType === "application/json") {
     body.response_format = { type: "json_object" };
+    // Force low temperature on JSON-mode calls — Qwen drifts from
+    // valid JSON above ~0.3 (random whitespace, smart quotes, missing
+    // commas). 0.2 keeps output deterministic and structurally clean.
+    // Caller can still override by passing ``temperature`` explicitly.
+    body.temperature = opts.temperature ?? 0.2;
+  } else if (opts.temperature != null) {
+    body.temperature = opts.temperature;
   }
+  if (opts.topP != null) body.top_p = opts.topP;
+  // Cap output tokens — without this, Qwen sometimes runs to its full
+  // 65K-token output limit on a script that should be 2K tokens. The
+  // wasted tokens cost you money + the request takes 10× longer +
+  // truncated JSON corrupts parsing. 8K is plenty for any single
+  // pipeline stage's structured output.
+  body.max_tokens = body.max_tokens ?? 8192;
 
   opts.onKeyUsed?.(maskKey(apiKey));
 
