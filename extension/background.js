@@ -153,7 +153,10 @@ async function startJob(payload) {
           },
         });
         try {
-          const jpeg = await fetchAndEncodeJpeg(url, quality);
+          // Pass the chapter URL as Referer — many CDNs (especially
+          // ones behind Cloudflare) reject hotlinked image requests
+          // whose referer doesn't match the host site.
+          const jpeg = await fetchAndEncodeJpeg(url, quality, chapterUrl);
           if (jpeg) jpegs.push(jpeg);
         } catch (err) {
           broadcast({ type: "LOG", text: `   ! Failed page ${p + 1}: ${err?.message || err}` });
@@ -312,7 +315,7 @@ async function discoverChapterImages(chapterUrl) {
       probe++;
       continue;
     }
-    const ok = await headOk(candidate);
+    const ok = await headOk(candidate, chapterUrl);
     if (ok) {
       ordered.push(candidate);
       seen.add(candidate);
@@ -453,14 +456,15 @@ function buildSequentialUrl(group, n) {
   return `${group.base}${padded}.${group.ext}`;
 }
 
-async function headOk(url) {
-  // HEAD often blocked by CDNs — do a tiny ranged GET instead.
+async function headOk(url, referer) {
+  // HEAD often blocked by CDNs — do a tiny ranged GET instead. Uses
+  // siteFetchInit() so referer + cookies match the rest of the
+  // pipeline (otherwise Cloudflare-protected probes 403 even when the
+  // actual image download would succeed).
   try {
-    const r = await fetch(url, {
-      method: "GET",
-      headers: { Range: "bytes=0-2" },
-      credentials: "omit",
-    });
+    const init = siteFetchInit(referer || url, { Range: "bytes=0-2" });
+    init.method = "GET";
+    const r = await fetch(url, init);
     if (!r.ok && r.status !== 206) return false;
     const ct = r.headers.get("content-type") || "";
     if (ct && !/image\//i.test(ct) && !/octet-stream/i.test(ct)) {
@@ -478,8 +482,8 @@ async function headOk(url) {
 // Image fetching + JPEG re-encode (handles WebP/PNG → JPEG)
 // -----------------------------------------------------------------------
 
-async function fetchAndEncodeJpeg(url, quality) {
-  const blob = await fetchBlob(url);
+async function fetchAndEncodeJpeg(url, quality, referer) {
+  const blob = await fetchBlob(url, referer);
   if (!blob) return null;
 
   // If it's already a JPEG and quality is high, we can skip the
@@ -505,14 +509,61 @@ async function fetchAndEncodeJpeg(url, quality) {
   return { bytes, width: canvas.width, height: canvas.height };
 }
 
+/**
+ * Build the fetch options most manga sites need to NOT 403:
+ *
+ *   - ``credentials: "include"`` so the user's own session cookies are
+ *     attached. Manhuaus, manhwafreak, etc. sit behind Cloudflare Bot
+ *     Fight Mode — they reject any request that doesn't carry the
+ *     ``cf_clearance`` cookie the user got when their browser solved
+ *     the challenge. With ``omit`` we were sending zero cookies and
+ *     getting an instant 403.
+ *
+ *   - ``Referer`` set to the site origin so referer-strict CDNs (some
+ *     image hosts only serve when the referer matches the site
+ *     domain) don't reject the request.
+ *
+ * Returns ``RequestInit`` ready to pass to fetch().
+ */
+function siteFetchInit(url, extraHeaders = {}) {
+  let referer = "";
+  try {
+    referer = new URL(url).origin + "/";
+  } catch {
+    /* invalid URL — referer stays empty */
+  }
+  return {
+    credentials: "include",
+    headers: {
+      ...(referer ? { Referer: referer } : {}),
+      ...extraHeaders,
+    },
+  };
+}
+
 async function fetchText(url) {
-  const r = await fetch(url, { credentials: "omit" });
-  if (!r.ok) throw new Error(`HTTP ${r.status} on ${url}`);
+  const r = await fetch(url, siteFetchInit(url));
+  if (!r.ok) {
+    // 403 / 503 from Cloudflare-fronted sites usually means the user
+    // hasn't completed the bot-check yet. Surface a friendlier hint
+    // alongside the raw status so they know what to do.
+    if (r.status === 403 || r.status === 503) {
+      throw new Error(
+        `HTTP ${r.status} on ${url} — Cloudflare blocking? Open the chapter URL in THIS Chrome window first, solve any "Verify you are human" challenge, then re-run.`,
+      );
+    }
+    throw new Error(`HTTP ${r.status} on ${url}`);
+  }
   return r.text();
 }
 
-async function fetchBlob(url) {
-  const r = await fetch(url, { credentials: "omit" });
+async function fetchBlob(url, referer) {
+  // For image fetches we'd ideally use the chapter-page URL as
+  // referer (most image CDNs check that the request "came from" the
+  // chapter page). Caller passes it in when known; we fall back to
+  // the image's own origin otherwise.
+  const init = siteFetchInit(referer || url);
+  const r = await fetch(url, init);
   if (!r.ok) return null;
   return r.blob();
 }
