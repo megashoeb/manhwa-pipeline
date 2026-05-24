@@ -263,7 +263,33 @@ function buildChapterUrl(info, n) {
  *      past the discovered range.
  */
 async function discoverChapterImages(chapterUrl) {
-  const html = await fetchText(chapterUrl);
+  // Try the cheap path first (direct fetch). Falls back to the
+  // browser-tab method when a Cloudflare-style 403/503 blocks us —
+  // some sites (manhuaus, mangabuddy, several Madara mirrors) won't
+  // serve their HTML to anything that doesn't look exactly like a
+  // real browser request. A hidden tab IS a real browser request, so
+  // Cloudflare's challenge auto-resolves and we get the rendered DOM.
+  let html;
+  try {
+    html = await fetchText(chapterUrl);
+  } catch (err) {
+    const msg = String(err?.message || err);
+    if (/HTTP 403|HTTP 503|Cloudflare/i.test(msg)) {
+      broadcast({
+        type: "LOG",
+        text: `   Direct fetch blocked (Cloudflare) — opening a hidden browser tab to bypass…`,
+      });
+      try {
+        html = await fetchChapterHtmlViaTab(chapterUrl);
+      } catch (tabErr) {
+        throw new Error(
+          `Both direct fetch and tab fallback failed. Direct: ${msg}. Tab: ${tabErr?.message || tabErr}`,
+        );
+      }
+    } else {
+      throw err;
+    }
+  }
 
   // FIRST: try the Madara WP-theme path. ``class="wp-manga-chapter-img"``
   // is the canonical marker used by the Madara theme that powers a HUGE
@@ -483,8 +509,19 @@ async function headOk(url, referer) {
 // -----------------------------------------------------------------------
 
 async function fetchAndEncodeJpeg(url, quality, referer) {
-  const blob = await fetchBlob(url, referer);
-  if (!blob) return null;
+  let blob = await fetchBlob(url, referer);
+  if (!blob) {
+    // Direct fetch returned null (likely 403 from a Cloudflare-fronted
+    // image CDN). Fall back to fetching from inside a hidden tab,
+    // where the browser's real session + TLS fingerprint usually
+    // gets through.
+    try {
+      blob = await fetchImageBlobViaTab(url, referer);
+    } catch {
+      blob = null;
+    }
+    if (!blob) return null;
+  }
 
   // If it's already a JPEG and quality is high, we can skip the
   // re-encode and just embed it directly. Keeps the PDF smaller +
@@ -539,6 +576,134 @@ function siteFetchInit(url, extraHeaders = {}) {
       ...extraHeaders,
     },
   };
+}
+
+/**
+ * Cloudflare-bypass fallback. Opens the chapter URL in a hidden
+ * (inactive) browser tab — the BROWSER itself does the navigation,
+ * so Cloudflare's bot-check sees a real Chrome window with real TLS
+ * fingerprint, real cookies, real Sec-Fetch-* headers. By the time
+ * the page fires its load event, the cf_clearance cookie is set on
+ * the site origin (also good for subsequent image fetches), Madara's
+ * lazy-load JS has run, and ``<img class="wp-manga-chapter-img">``
+ * tags are in the DOM with their real CDN URLs.
+ *
+ * We then pull the rendered HTML out of the tab via a content script
+ * and close the tab. Total cost ~3-5 sec per chapter — slower than
+ * direct fetch but unblocks otherwise-impossible sites.
+ */
+async function fetchChapterHtmlViaTab(url) {
+  // Background tab so the user's foreground stays put.
+  const tab = await chrome.tabs.create({ url, active: false });
+  const tabId = tab.id;
+  try {
+    // Wait for ``status === "complete"`` (DOM + most subresources loaded).
+    await waitForTabComplete(tabId, 30000);
+    // Give Madara's lazy-loader a beat to swap data-src → src and let
+    // any Cloudflare JS-challenge stabilise the cookie state.
+    await new Promise((r) => setTimeout(r, 1500));
+    // Extract the rendered DOM as a string and ship it back.
+    const results = await chrome.scripting.executeScript({
+      target: { tabId },
+      // The content script runs in the PAGE'S context, so it sees the
+      // DOM the user would see — including any JS-injected images.
+      func: () => document.documentElement.outerHTML,
+    });
+    const html = results?.[0]?.result;
+    if (typeof html !== "string" || html.length === 0) {
+      throw new Error("Tab returned empty HTML");
+    }
+    return html;
+  } finally {
+    try {
+      await chrome.tabs.remove(tabId);
+    } catch {
+      /* tab already closed */
+    }
+  }
+}
+
+/**
+ * Image fetch via a tab — used when the direct fetch path 403s on a
+ * Cloudflare-fronted image CDN. We navigate a hidden tab to the
+ * chapter page (so cookies + referer are real), then fetch the image
+ * from inside the page's context using the page's own ``fetch()`` —
+ * the request is indistinguishable from one a script on the page
+ * would make.
+ *
+ * Tabs are expensive to create per-image, so callers should batch
+ * (currently we fall back per-image only when direct fetch fails;
+ * once the cf_clearance cookie is set by the HTML-via-tab call, most
+ * subsequent direct image fetches succeed without needing this path).
+ */
+async function fetchImageBlobViaTab(imageUrl, referer) {
+  const tab = await chrome.tabs.create({
+    url: referer || new URL(imageUrl).origin + "/",
+    active: false,
+  });
+  const tabId = tab.id;
+  try {
+    await waitForTabComplete(tabId, 30000);
+    const results = await chrome.scripting.executeScript({
+      target: { tabId },
+      args: [imageUrl],
+      func: async (url) => {
+        const r = await fetch(url, { credentials: "include" });
+        if (!r.ok) throw new Error(`HTTP ${r.status}`);
+        const blob = await r.blob();
+        // Have to round-trip via base64 — chrome.scripting can't ship
+        // a Blob back to the background service worker directly.
+        const buf = await blob.arrayBuffer();
+        const bytes = new Uint8Array(buf);
+        let bin = "";
+        const chunk = 0x8000;
+        for (let i = 0; i < bytes.length; i += chunk) {
+          bin += String.fromCharCode.apply(null, bytes.subarray(i, i + chunk));
+        }
+        return { base64: btoa(bin), type: blob.type || "image/jpeg" };
+      },
+    });
+    const payload = results?.[0]?.result;
+    if (!payload?.base64) return null;
+    const binary = atob(payload.base64);
+    const bytes = new Uint8Array(binary.length);
+    for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+    return new Blob([bytes], { type: payload.type });
+  } finally {
+    try {
+      await chrome.tabs.remove(tabId);
+    } catch {
+      /* already closed */
+    }
+  }
+}
+
+/** Resolve once Chrome marks the tab as fully loaded, or reject on timeout. */
+function waitForTabComplete(tabId, timeoutMs) {
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => {
+      chrome.tabs.onUpdated.removeListener(listener);
+      reject(new Error(`Tab ${tabId} did not finish loading within ${timeoutMs}ms`));
+    }, timeoutMs);
+    const listener = (id, info) => {
+      if (id === tabId && info.status === "complete") {
+        clearTimeout(timer);
+        chrome.tabs.onUpdated.removeListener(listener);
+        resolve();
+      }
+    };
+    chrome.tabs.onUpdated.addListener(listener);
+    // Check the current status in case the tab already completed
+    // before we attached the listener (rare race condition).
+    chrome.tabs.get(tabId, (t) => {
+      if (chrome.runtime.lastError) return; // tab disappeared
+      if (t.status === "complete") {
+        clearTimeout(timer);
+        chrome.tabs.onUpdated.removeListener(listener);
+        resolve();
+      }
+    });
+  });
 }
 
 async function fetchText(url) {
