@@ -92,10 +92,80 @@ function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => window.setTimeout(resolve, ms));
 }
 
+// OpenRouter / Alibaba enforces a 30 MB per-request cap on image
+// content. We size panels conservatively to fit a 30-panel chapter
+// (the common comprehend stage payload) under that ceiling. Gemini
+// has no such cap so this code path is OpenRouter-only.
+//
+// Sizing tiers — chosen empirically after the user hit HTTP 413
+// errors on a 30-panel comprehend call at 768 px / quality 0.85:
+//
+//   ≤ 12 panels  → 512 px max edge, quality 0.75  (good OCR fidelity)
+//   ≤ 25 panels  → 384 px max edge, quality 0.7   (still readable text)
+//   > 25 panels  → 256 px max edge, quality 0.65  (recognisable scene
+//                                                   but small dialogue)
+//
+// The post-encode safety check below catches any oversize cases that
+// slip through (chapters with abnormally tall panels) and re-encodes
+// at the next tier down.
+function sizingForImageCount(count: number): {
+  maxEdge: number;
+  quality: number;
+} {
+  if (count <= 12) return { maxEdge: 512, quality: 0.75 };
+  if (count <= 25) return { maxEdge: 384, quality: 0.7 };
+  return { maxEdge: 256, quality: 0.65 };
+}
+const OPENROUTER_TOTAL_BUDGET_BYTES = 22 * 1024 * 1024; // 22 MB hard cap (well under 30 MB with safety margin)
+
+/**
+ * Aggressively downscale + re-encode a single blob to keep the
+ * total request payload under OpenRouter's 30 MB cap. Always
+ * re-encodes (even if dimensions are already small) because we want
+ * the lower-quality JPEG output for size, not the original.
+ */
+async function downscaleForOpenRouter(
+  blob: Blob,
+  maxEdge: number,
+  quality: number,
+): Promise<Blob> {
+  const bitmap = await createImageBitmap(blob);
+  try {
+    const longest = Math.max(bitmap.width, bitmap.height);
+    const scale = Math.min(1, maxEdge / longest);
+    const w = Math.max(1, Math.round(bitmap.width * scale));
+    const h = Math.max(1, Math.round(bitmap.height * scale));
+    const canvas = document.createElement("canvas");
+    canvas.width = w;
+    canvas.height = h;
+    const ctx = canvas.getContext("2d");
+    if (!ctx) throw new Error("2D canvas context unavailable");
+    ctx.drawImage(bitmap, 0, 0, w, h);
+    const out = await new Promise<Blob>((resolve, reject) => {
+      canvas.toBlob(
+        (b) => (b ? resolve(b) : reject(new Error("toBlob returned null"))),
+        "image/jpeg",
+        quality,
+      );
+    });
+    // Release backing store immediately.
+    canvas.width = 0;
+    canvas.height = 0;
+    return out;
+  } finally {
+    bitmap.close();
+  }
+}
+
 /**
  * Build the messages array from a Gemini-style prompt + image blobs.
  * Single user message with mixed content parts when images exist,
  * plain text content otherwise.
+ *
+ * Vision images go through ``downscaleForOpenRouter`` first to
+ * shrink them to a size that fits the provider's 30 MB-per-request
+ * cap. If the FIRST pass at 512 px still over-shoots the budget, we
+ * re-shrink to 384 px and try again.
  */
 async function buildMessages(
   prompt: string,
@@ -104,8 +174,50 @@ async function buildMessages(
   if (!images || images.length === 0) {
     return [{ role: "user", content: prompt }];
   }
+
+  // Pick initial sizing tier from panel count, then verify post-encode.
+  let { maxEdge, quality } = sizingForImageCount(images.length);
+  let downscaled = await Promise.all(
+    images.map((b) => downscaleForOpenRouter(b, maxEdge, quality)),
+  );
+  let totalBytes = downscaled.reduce((sum, b) => sum + b.size, 0);
+
+  // Safety net — if even the count-based tier overshoots (chapters
+  // with abnormally tall webtoon panels), keep ratcheting down until
+  // we fit. Hard floor at 192 px so we never produce literally
+  // unreadable thumbnails.
+  while (
+    totalBytes * 1.34 > OPENROUTER_TOTAL_BUDGET_BYTES &&
+    maxEdge > 192
+  ) {
+    maxEdge = Math.max(192, Math.round(maxEdge * 0.75));
+    quality = Math.max(0.55, quality - 0.05);
+    debugLog.push({
+      type: "warn",
+      label: `Image payload over budget — re-shrinking to ${maxEdge}px / q${quality}`,
+      context: {
+        previousTotalMB: +(totalBytes / 1024 / 1024).toFixed(2),
+        budgetMB: OPENROUTER_TOTAL_BUDGET_BYTES / 1024 / 1024,
+        imageCount: images.length,
+      },
+    });
+    downscaled = await Promise.all(
+      images.map((b) => downscaleForOpenRouter(b, maxEdge, quality)),
+    );
+    totalBytes = downscaled.reduce((sum, b) => sum + b.size, 0);
+  }
+
+  debugLog.push({
+    type: "info",
+    label: `OpenRouter payload ready: ${images.length} images @ ${maxEdge}px / q${quality}`,
+    context: {
+      totalMB: +(totalBytes / 1024 / 1024).toFixed(2),
+      avgKBperImage: +(totalBytes / 1024 / images.length).toFixed(1),
+    },
+  });
+
   const parts: ContentPart[] = [{ type: "text", text: prompt }];
-  for (const blob of images) {
+  for (const blob of downscaled) {
     const base64 = await blobToBase64(blob);
     const mime = blob.type || "image/jpeg";
     parts.push({
