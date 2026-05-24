@@ -262,6 +262,26 @@ function buildChapterUrl(info, n) {
 async function discoverChapterImages(chapterUrl) {
   const html = await fetchText(chapterUrl);
 
+  // FIRST: try the Madara WP-theme path. ``class="wp-manga-chapter-img"``
+  // is the canonical marker used by the Madara theme that powers a HUGE
+  // chunk of manga/manhua aggregators — manhuaus.com, manhwafreak.com,
+  // manytoon.com, isekaiscan.com, asurascans variants, etc. The theme
+  // pre-marks the chapter image tags so we don't have to guess. The
+  // real image URL lives in ``data-src`` (with a placeholder in ``src``
+  // until the lazy-loader swaps it on scroll), so we prefer that.
+  //
+  // If we find Madara images, trust them — they're already in correct
+  // page order and we skip the numeric-walk probe entirely (saves time
+  // and avoids 404s on sites where the URL pattern isn't sequential).
+  const madaraUrls = extractMadaraImages(html, chapterUrl);
+  if (madaraUrls.length > 0) {
+    broadcast({
+      type: "LOG",
+      text: `   (Madara theme detected — using ${madaraUrls.length} pre-marked image(s))`,
+    });
+    return madaraUrls;
+  }
+
   const rawUrls = extractImageUrls(html, chapterUrl);
   const numericGroups = groupNumericImages(rawUrls);
 
@@ -345,6 +365,68 @@ function absolutize(u, base) {
   } catch {
     return null;
   }
+}
+
+/**
+ * Madara WP-theme image extraction.
+ *
+ * Matches any ``<img>`` whose class list contains
+ * ``wp-manga-chapter-img`` — the Madara theme's canonical marker for
+ * chapter pages. Returns URLs in document order, preferring
+ * ``data-src`` (the real lazy-loaded URL) over ``src`` (usually a
+ * placeholder spinner). Falls back to ``data-lazy-src``,
+ * ``data-original`` if those are the only attrs present.
+ *
+ * Sites this catches (sample): manhuaus.com, manhwafreak.com,
+ * manytoon.com, isekaiscan.com, mangabuddy.com, several asurascans
+ * mirrors, and dozens of smaller Madara-based aggregators.
+ *
+ * Returns ``[]`` if the page isn't Madara — caller falls back to the
+ * numeric-filename heuristic.
+ */
+function extractMadaraImages(html, baseUrl) {
+  const urls = [];
+  const seen = new Set();
+  // Capture full ``<img ...>`` tags carrying the marker class. The
+  // class attribute may have additional classes around the marker
+  // (e.g. ``class="wp-manga-chapter-img lazyloaded"``) so we don't
+  // anchor on exact equality.
+  const imgRe =
+    /<img\b[^>]*?\bclass\s*=\s*["'][^"']*?\bwp-manga-chapter-img\b[^"']*?["'][^>]*>/gi;
+  let m;
+  while ((m = imgRe.exec(html)) !== null) {
+    const tag = m[0];
+    // Lazy-loaded sites stash the real URL in one of these attrs;
+    // ``src`` is usually a 1×1 placeholder until JS swaps it in.
+    const candidates = [
+      /\bdata-src\s*=\s*["']([^"']+)["']/i,
+      /\bdata-lazy-src\s*=\s*["']([^"']+)["']/i,
+      /\bdata-original\s*=\s*["']([^"']+)["']/i,
+      /\bsrc\s*=\s*["']([^"']+)["']/i,
+    ];
+    let raw = null;
+    for (const re of candidates) {
+      const cm = tag.match(re);
+      if (cm && cm[1]) {
+        const val = cm[1].trim();
+        // Skip obvious placeholder data: URIs.
+        if (val.startsWith("data:")) continue;
+        raw = val;
+        break;
+      }
+    }
+    if (!raw) continue;
+    const abs = absolutize(raw, baseUrl);
+    if (!abs) continue;
+    // Only accept image content-types (Madara sometimes embeds icon
+    // ``<img>`` tags inside the chapter container that ALSO carry the
+    // marker class — filter on extension as a sanity check).
+    if (!/\.(webp|jpg|jpeg|png|gif)(\?|$)/i.test(abs)) continue;
+    if (seen.has(abs)) continue;
+    seen.add(abs);
+    urls.push(abs);
+  }
+  return urls;
 }
 
 function groupNumericImages(urls) {

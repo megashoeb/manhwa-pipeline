@@ -1,6 +1,8 @@
 # Manhwa Chapter → PDF Downloader (Chrome Extension)
 
-Yeh extension manhwa sites (asurascans, vortexscans, etc.) ke chapter pages se images scrape karta hai aur **chapter-wise PDFs** banake aapke `Downloads` folder me save kar deta hai. Koi external library use nahi hoti — sab kuch built-in JS me hai.
+Yeh extension manhwa / manhua sites ke chapter pages se images scrape karta hai aur **chapter-wise PDFs** banake aapke `Downloads` folder me save kar deta hai. Koi external library use nahi hoti — sab kuch built-in JS me hai.
+
+**Supported sites:** asurascans, vortexscans, manhuaus.com, manhwafreak.com, manytoon.com, isekaiscan.com, mangabuddy.com, aur Madara WP-theme pe based dozens of other aggregators. Generic numeric-filename sites (`/001.webp`, `/002.webp` …) bhi auto-detect ho jaate hain.
 
 ---
 
@@ -21,6 +23,8 @@ Yeh extension manhwa sites (asurascans, vortexscans, etc.) ke chapter pages se i
 1. Apne browser me **pehla chapter** open karo jisse aap shuru karna chahte ho — jaise:
    - `https://asurascans.com/comics/<slug>-<hash>/chapter/1`
    - `https://vortexscans.org/series/<slug>/chapter-1`
+   - `https://manhuaus.com/manga/<slug>/chapter-1/`
+   - `https://manhwafreak.com/manga/<slug>/chapter-1/`
 2. URL bar se URL **copy** karo.
 3. Extension icon pe click karo → popup khulega.
 4. Popup me:
@@ -52,11 +56,12 @@ For each chapter:
 
 1. **URL increment** — `…/chapter-1` ya `…/chapter/1` ka number badhake N+1, N+2, … bana leta hai.
 2. **HTML scrape** — page ka HTML fetch karke saari `<img>` URLs nikalta hai (including lazy-loaded `data-src`, `srcset`, aur inline JSON image lists).
-3. **Sequence detect** — `/001.webp`, `/002.webp` jaise numeric filenames ka largest group find karta hai.
-4. **404 walk** — last detected page ke aage probe karta hai (Range GET) jab tak 2 consecutive misses na aaye — taaki lazy-loaded later pages bhi mil jaaye.
-5. **WebP → JPEG** — `OffscreenCanvas` + `createImageBitmap` se decode karke JPEG re-encode (already-JPEG images skip ho jaate hain).
-6. **PDF build** — minimal PDF writer (no jsPDF / pdf-lib dependency) JPEG ko `DCTDecode` XObject ke roop me embed karta hai — koi quality loss nahi.
-7. **Save** — `chrome.downloads.download()` se file system pe save.
+3. **Madara theme detection** — agar page me `class="wp-manga-chapter-img"` waali `<img>` tags milti hain (manhuaus, manhwafreak, manytoon, etc.), unhe directly use kar leta hai. Ye theme images ko pre-mark karta hai, isliye guess karne ki zaroorat nahi.
+4. **Sequence detect (fallback)** — Madara nahi mile to `/001.webp`, `/002.webp` jaise numeric filenames ka largest group find karta hai.
+5. **404 walk** — last detected page ke aage probe karta hai (Range GET) jab tak 2 consecutive misses na aaye — taaki lazy-loaded later pages bhi mil jaaye.
+6. **WebP → JPEG** — `OffscreenCanvas` + `createImageBitmap` se decode karke JPEG re-encode (already-JPEG images skip ho jaate hain).
+7. **PDF build** — minimal PDF writer (no jsPDF / pdf-lib dependency) JPEG ko `DCTDecode` XObject ke roop me embed karta hai — koi quality loss nahi.
+8. **Save** — `chrome.downloads.download()` se file system pe save.
 
 Stop button kabhi bhi dabao — currently running chapter ke beech me cleanly abort ho jayega.
 
