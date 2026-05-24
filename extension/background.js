@@ -87,6 +87,13 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
   return false;
 });
 
+// Single source of truth for the version marker we stamp into the
+// first log line of every batch. Lets the user verify at a glance
+// (in the popup log) which build is actually running — the
+// chrome://extensions/ page sometimes caches the manifest version
+// even after a reload, so an in-log marker is the only reliable signal.
+const EXTENSION_BUILD = "v1.4.3 batch-bypass";
+
 async function startJob(payload) {
   const {
     startUrl,
@@ -102,6 +109,10 @@ async function startJob(payload) {
   state.current = 0;
   state.total = chapterCount;
   state.label = "Starting";
+
+  // Stamp the build marker as the very first log entry so the user
+  // can confirm the new code path is active (vs. an old cached SW).
+  broadcast({ type: "LOG", text: `Build: ${EXTENSION_BUILD}` });
 
   broadcast({ type: "PROGRESS", payload: { current: 0, total: chapterCount, label: "Starting" } });
 
