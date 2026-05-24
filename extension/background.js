@@ -116,6 +116,7 @@ async function startJob(payload) {
   for (let i = 0; i < chapterCount; i++) {
     if (state.aborted) {
       broadcast({ type: "ABORTED" });
+      await closeBypassTab();
       state.running = false;
       return;
     }
@@ -205,6 +206,10 @@ async function startJob(payload) {
   } else {
     broadcast({ type: "DONE", text: `Finished ${chapterCount} chapter(s).` });
   }
+  // Close the Cloudflare-bypass tab (if any) at the end of every
+  // batch — leaving it lying around isn't useful and clutters the
+  // user's tab strip.
+  await closeBypassTab();
   state.running = false;
   state.aborted = false;
 }
@@ -578,49 +583,185 @@ function siteFetchInit(url, extraHeaders = {}) {
   };
 }
 
+// Persistent "bypass tab" we reuse across the whole batch. Opening a
+// fresh tab per chapter wastes 3-5 sec of Cloudflare challenge time
+// every time and ignores the cf_clearance cookie the previous tab
+// already earned. Keeping one tab around means: solve Cloudflare
+// once (visibly if needed), then breeze through the rest.
+let bypassTabId = null;
+
 /**
- * Cloudflare-bypass fallback. Opens the chapter URL in a hidden
- * (inactive) browser tab — the BROWSER itself does the navigation,
- * so Cloudflare's bot-check sees a real Chrome window with real TLS
- * fingerprint, real cookies, real Sec-Fetch-* headers. By the time
- * the page fires its load event, the cf_clearance cookie is set on
- * the site origin (also good for subsequent image fetches), Madara's
- * lazy-load JS has run, and ``<img class="wp-manga-chapter-img">``
- * tags are in the DOM with their real CDN URLs.
- *
- * We then pull the rendered HTML out of the tab via a content script
- * and close the tab. Total cost ~3-5 sec per chapter — slower than
- * direct fetch but unblocks otherwise-impossible sites.
+ * Ensure we have a working bypass tab. If one's already open from a
+ * previous chapter, navigate it. Otherwise create a new background
+ * tab. Returns the tab id.
  */
-async function fetchChapterHtmlViaTab(url) {
-  // Background tab so the user's foreground stays put.
-  const tab = await chrome.tabs.create({ url, active: false });
-  const tabId = tab.id;
-  try {
-    // Wait for ``status === "complete"`` (DOM + most subresources loaded).
-    await waitForTabComplete(tabId, 30000);
-    // Give Madara's lazy-loader a beat to swap data-src → src and let
-    // any Cloudflare JS-challenge stabilise the cookie state.
-    await new Promise((r) => setTimeout(r, 1500));
-    // Extract the rendered DOM as a string and ship it back.
-    const results = await chrome.scripting.executeScript({
-      target: { tabId },
-      // The content script runs in the PAGE'S context, so it sees the
-      // DOM the user would see — including any JS-injected images.
-      func: () => document.documentElement.outerHTML,
-    });
-    const html = results?.[0]?.result;
-    if (typeof html !== "string" || html.length === 0) {
-      throw new Error("Tab returned empty HTML");
-    }
-    return html;
-  } finally {
+async function ensureBypassTab(url) {
+  if (bypassTabId !== null) {
     try {
-      await chrome.tabs.remove(tabId);
+      await chrome.tabs.get(bypassTabId);
+      // Tab still exists — navigate it to the new URL.
+      await chrome.tabs.update(bypassTabId, { url });
+      return bypassTabId;
     } catch {
-      /* tab already closed */
+      // Tab was closed by the user or by Chrome's tab discarding.
+      bypassTabId = null;
     }
   }
+  const tab = await chrome.tabs.create({ url, active: false });
+  bypassTabId = tab.id;
+  return tab.id;
+}
+
+/** Close the bypass tab if it's open. Called at the end of every batch. */
+async function closeBypassTab() {
+  if (bypassTabId === null) return;
+  try {
+    await chrome.tabs.remove(bypassTabId);
+  } catch {
+    /* already closed */
+  }
+  bypassTabId = null;
+}
+
+/**
+ * Cloudflare-bypass fallback. Uses a real browser tab to load the
+ * chapter page — Cloudflare's bot-check sees a genuine Chrome window
+ * with proper TLS fingerprint, cookies, and JS execution, so the
+ * challenge auto-resolves. We then read the rendered DOM via a
+ * content script.
+ *
+ * Robustness:
+ *   - Reuses ``bypassTabId`` across chapters so cf_clearance persists.
+ *   - Polls for Madara images in the DOM (up to 30s) instead of
+ *     guessing how long Cloudflare's challenge will take.
+ *   - Detects Cloudflare challenge / interstitial pages and waits
+ *     them out; if the challenge persists past 8 sec we make the tab
+ *     VISIBLE so the user can click the checkbox / solve it.
+ *
+ * Typical cost: ~3-5 sec/chapter on a warmed-up tab, 10-15 sec on
+ * the first chapter (Cloudflare challenge round).
+ */
+async function fetchChapterHtmlViaTab(url) {
+  const tabId = await ensureBypassTab(url);
+  // Tab might already be on this URL from a previous call — force
+  // the navigation so we get a fresh load.
+  try {
+    await chrome.tabs.update(tabId, { url });
+  } catch {
+    /* tab may have been closed mid-flight; ensureBypassTab will re-create on retry */
+  }
+
+  // Wait for the navigation to actually start + DOM to fire its
+  // load event. 30 sec ceiling covers slow Cloudflare turnstiles.
+  await new Promise((r) => setTimeout(r, 400));
+  await waitForTabComplete(tabId, 30000);
+
+  // Poll the DOM until either Madara images appear OR we time out.
+  // Page-load "complete" fires before async JS finishes, so we can't
+  // just read HTML immediately — chapter images are JS-injected.
+  const POLL_INTERVAL_MS = 800;
+  const MAX_POLL_MS = 30000;
+  const startedAt = Date.now();
+  let madeVisible = false;
+  let lastHtml = "";
+
+  while (Date.now() - startedAt < MAX_POLL_MS) {
+    if (state.aborted) throw new Error("Aborted by user");
+    let probe;
+    try {
+      const results = await chrome.scripting.executeScript({
+        target: { tabId },
+        func: () => {
+          // Cloudflare interstitial / challenge fingerprints. Any of
+          // these means we're not on the real page yet.
+          const t = document.title || "";
+          const onChallenge =
+            /just a moment|attention required|verifying|verify you are/i.test(t) ||
+            !!document.querySelector("#challenge-running") ||
+            !!document.querySelector("#cf-challenge-stage") ||
+            !!document.querySelector(".cf-browser-verification") ||
+            !!document.querySelector('iframe[src*="challenges.cloudflare.com"]') ||
+            !!document.querySelector('script[src*="challenge-platform"]');
+          const madaraCount = document.querySelectorAll(
+            "img.wp-manga-chapter-img",
+          ).length;
+          // Generic "this is a real manga chapter page" signal — many
+          // sites wrap their reader in a ``.reading-content`` div.
+          const readerImgCount = document.querySelectorAll(
+            ".reading-content img, .text-left img, .chapter-content img",
+          ).length;
+          return {
+            onChallenge,
+            madaraCount,
+            readerImgCount,
+            html: document.documentElement.outerHTML,
+            title: t,
+          };
+        },
+      });
+      probe = results?.[0]?.result;
+    } catch (err) {
+      // Tab navigated/closed under us — bail.
+      throw new Error(
+        `Tab script failed: ${err?.message || err}. Tab may have been closed.`,
+      );
+    }
+    if (!probe) {
+      await new Promise((r) => setTimeout(r, POLL_INTERVAL_MS));
+      continue;
+    }
+    lastHtml = probe.html || lastHtml;
+
+    if (probe.onChallenge) {
+      // After 8 sec of being stuck on the challenge, surface the tab
+      // so the user can click the verify checkbox / solve any
+      // managed challenge that needs interaction.
+      if (!madeVisible && Date.now() - startedAt > 8000) {
+        madeVisible = true;
+        try {
+          await chrome.tabs.update(tabId, { active: true });
+          broadcast({
+            type: "LOG",
+            text: `   Cloudflare challenge stuck — bypass tab is now visible. Click "Verify you are human" if asked.`,
+          });
+        } catch {
+          /* ignore */
+        }
+      }
+      await new Promise((r) => setTimeout(r, POLL_INTERVAL_MS));
+      continue;
+    }
+
+    if (probe.madaraCount > 0 || probe.readerImgCount > 0) {
+      // Real chapter content visible. Hand back the HTML and put the
+      // tab back in the background for the next chapter.
+      if (madeVisible) {
+        try {
+          await chrome.tabs.update(tabId, { active: false });
+        } catch {
+          /* ignore */
+        }
+      }
+      return probe.html;
+    }
+
+    // No challenge, no images yet — keep polling. Madara lazy-loader
+    // sometimes needs a moment.
+    await new Promise((r) => setTimeout(r, POLL_INTERVAL_MS));
+  }
+
+  // Timed out. Return whatever HTML we last captured — caller will
+  // try the numeric-filename heuristic on it as a last resort.
+  if (lastHtml) {
+    broadcast({
+      type: "LOG",
+      text: `   Tab content-poll timed out — handing back partial HTML to try heuristic extraction.`,
+    });
+    return lastHtml;
+  }
+  throw new Error(
+    `Tab fetch timed out after ${Math.round(MAX_POLL_MS / 1000)}s — Cloudflare challenge unresolved. Try opening the chapter URL in a normal Chrome tab manually first.`,
+  );
 }
 
 /**
