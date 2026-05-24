@@ -142,25 +142,80 @@ async function startJob(payload) {
       broadcast({ type: "LOG", text: `   Found ${imageUrls.length} image(s).` });
 
       const jpegs = [];
-      for (let p = 0; p < imageUrls.length; p++) {
-        if (state.aborted) break;
-        const url = imageUrls[p];
+      // FAST PATH: if a bypass tab is open from the Cloudflare HTML
+      // fetch, batch-download every image through the page's own
+      // fetch() context. ~3-5 sec total for a full chapter vs 60+
+      // sec serial. We must do this BEFORE the next chapter loop
+      // iteration navigates the bypass tab away from this chapter.
+      if (bypassTabId !== null) {
         broadcast({
           type: "PROGRESS",
           payload: {
             current: chapterIndex,
             total: chapterCount,
-            label: `Chapter ${chapterNum} — page ${p + 1}/${imageUrls.length}`,
+            label: `Chapter ${chapterNum} — fetching ${imageUrls.length} images via bypass tab`,
           },
         });
-        try {
-          // Pass the chapter URL as Referer — many CDNs (especially
-          // ones behind Cloudflare) reject hotlinked image requests
-          // whose referer doesn't match the host site.
-          const jpeg = await fetchAndEncodeJpeg(url, quality, chapterUrl);
-          if (jpeg) jpegs.push(jpeg);
-        } catch (err) {
-          broadcast({ type: "LOG", text: `   ! Failed page ${p + 1}: ${err?.message || err}` });
+        const batch = await fetchAllImagesViaBypassTab(imageUrls);
+        let okCount = 0;
+        let failCount = 0;
+        for (let p = 0; p < batch.length; p++) {
+          if (state.aborted) break;
+          const entry = batch[p];
+          if (!entry.blob) {
+            failCount++;
+            broadcast({
+              type: "LOG",
+              text: `   ! Page ${p + 1} fetch failed: ${entry.error}`,
+            });
+            continue;
+          }
+          try {
+            const jpeg = await encodeJpegFromBlob(entry.blob, quality);
+            if (jpeg) {
+              jpegs.push(jpeg);
+              okCount++;
+            } else {
+              failCount++;
+            }
+          } catch (err) {
+            failCount++;
+            broadcast({
+              type: "LOG",
+              text: `   ! Page ${p + 1} encode failed: ${err?.message || err}`,
+            });
+          }
+        }
+        broadcast({
+          type: "LOG",
+          text: `   Downloaded ${okCount}/${imageUrls.length} via bypass tab${failCount ? ` (${failCount} failed)` : ""}.`,
+        });
+      } else {
+        // SLOW PATH: no bypass tab → direct fetch per image (with
+        // per-image tab fallback baked into fetchAndEncodeJpeg).
+        for (let p = 0; p < imageUrls.length; p++) {
+          if (state.aborted) break;
+          const url = imageUrls[p];
+          broadcast({
+            type: "PROGRESS",
+            payload: {
+              current: chapterIndex,
+              total: chapterCount,
+              label: `Chapter ${chapterNum} — page ${p + 1}/${imageUrls.length}`,
+            },
+          });
+          try {
+            // Pass the chapter URL as Referer — many CDNs (especially
+            // ones behind Cloudflare) reject hotlinked image requests
+            // whose referer doesn't match the host site.
+            const jpeg = await fetchAndEncodeJpeg(url, quality, chapterUrl);
+            if (jpeg) jpegs.push(jpeg);
+          } catch (err) {
+            broadcast({
+              type: "LOG",
+              text: `   ! Failed page ${p + 1}: ${err?.message || err}`,
+            });
+          }
         }
       }
 
@@ -517,20 +572,27 @@ async function fetchAndEncodeJpeg(url, quality, referer) {
   let blob = await fetchBlob(url, referer);
   if (!blob) {
     // Direct fetch returned null (likely 403 from a Cloudflare-fronted
-    // image CDN). Fall back to fetching from inside a hidden tab,
-    // where the browser's real session + TLS fingerprint usually
-    // gets through.
+    // image CDN). Fall back to fetching from inside the bypass tab.
     try {
-      blob = await fetchImageBlobViaTab(url, referer);
+      blob = await fetchImageBlobViaTab(url);
     } catch {
       blob = null;
     }
     if (!blob) return null;
   }
+  return encodeJpegFromBlob(blob, quality);
+}
 
-  // If it's already a JPEG and quality is high, we can skip the
-  // re-encode and just embed it directly. Keeps the PDF smaller +
-  // avoids a generation loss.
+/**
+ * Convert any image blob (JPEG / WebP / PNG) to the
+ * ``{ bytes, width, height }`` shape the PDF builder expects.
+ *   - Already JPEG with parseable SOF marker → reuse bytes as-is
+ *     (smaller output, no generation loss).
+ *   - Anything else → decode via createImageBitmap, draw to
+ *     OffscreenCanvas, re-encode as JPEG at the requested quality.
+ */
+async function encodeJpegFromBlob(blob, quality) {
+  if (!blob) return null;
   const ct = (blob.type || "").toLowerCase();
   if (ct === "image/jpeg" || ct === "image/jpg") {
     const buf = new Uint8Array(await blob.arrayBuffer());
@@ -539,8 +601,6 @@ async function fetchAndEncodeJpeg(url, quality, referer) {
       return { bytes: buf, width: dims.width, height: dims.height };
     }
   }
-
-  // Otherwise decode + re-encode as JPEG.
   const bitmap = await createImageBitmap(blob);
   const canvas = new OffscreenCanvas(bitmap.width, bitmap.height);
   const ctx = canvas.getContext("2d");
@@ -765,43 +825,41 @@ async function fetchChapterHtmlViaTab(url) {
 }
 
 /**
- * Image fetch via a tab — used when the direct fetch path 403s on a
- * Cloudflare-fronted image CDN. We navigate a hidden tab to the
- * chapter page (so cookies + referer are real), then fetch the image
- * from inside the page's context using the page's own ``fetch()`` —
- * the request is indistinguishable from one a script on the page
- * would make.
+ * Image fetch via the existing bypass tab. After
+ * ``fetchChapterHtmlViaTab`` runs, ``bypassTabId`` is open on the
+ * chapter page with the right session — cf_clearance cookie, hotlink
+ * referer, full TLS fingerprint. We execute ``fetch()`` from inside
+ * THAT page's context, so the request is indistinguishable from one
+ * the page's own JavaScript would make (which is the only thing
+ * Cloudflare-fronted image CDNs reliably allow).
  *
- * Tabs are expensive to create per-image, so callers should batch
- * (currently we fall back per-image only when direct fetch fails;
- * once the cf_clearance cookie is set by the HTML-via-tab call, most
- * subsequent direct image fetches succeed without needing this path).
+ * Returns null if the bypass tab isn't open — caller falls back to
+ * a direct SW fetch which will likely 403, but at least won't crash.
  */
-async function fetchImageBlobViaTab(imageUrl, referer) {
-  const tab = await chrome.tabs.create({
-    url: referer || new URL(imageUrl).origin + "/",
-    active: false,
-  });
-  const tabId = tab.id;
+async function fetchImageBlobViaTab(imageUrl) {
+  if (bypassTabId === null) return null;
   try {
-    await waitForTabComplete(tabId, 30000);
     const results = await chrome.scripting.executeScript({
-      target: { tabId },
+      target: { tabId: bypassTabId },
       args: [imageUrl],
       func: async (url) => {
-        const r = await fetch(url, { credentials: "include" });
-        if (!r.ok) throw new Error(`HTTP ${r.status}`);
-        const blob = await r.blob();
-        // Have to round-trip via base64 — chrome.scripting can't ship
-        // a Blob back to the background service worker directly.
-        const buf = await blob.arrayBuffer();
-        const bytes = new Uint8Array(buf);
-        let bin = "";
-        const chunk = 0x8000;
-        for (let i = 0; i < bytes.length; i += chunk) {
-          bin += String.fromCharCode.apply(null, bytes.subarray(i, i + chunk));
+        try {
+          const r = await fetch(url, { credentials: "include" });
+          if (!r.ok) return { error: `HTTP ${r.status}` };
+          const blob = await r.blob();
+          // Round-trip via base64 — chrome.scripting can't ship a
+          // Blob back to the service worker directly.
+          const buf = await blob.arrayBuffer();
+          const bytes = new Uint8Array(buf);
+          let bin = "";
+          const chunk = 0x8000;
+          for (let i = 0; i < bytes.length; i += chunk) {
+            bin += String.fromCharCode.apply(null, bytes.subarray(i, i + chunk));
+          }
+          return { base64: btoa(bin), type: blob.type || "image/jpeg" };
+        } catch (err) {
+          return { error: String(err?.message || err) };
         }
-        return { base64: btoa(bin), type: blob.type || "image/jpeg" };
       },
     });
     const payload = results?.[0]?.result;
@@ -810,13 +868,91 @@ async function fetchImageBlobViaTab(imageUrl, referer) {
     const bytes = new Uint8Array(binary.length);
     for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
     return new Blob([bytes], { type: payload.type });
-  } finally {
-    try {
-      await chrome.tabs.remove(tabId);
-    } catch {
-      /* already closed */
-    }
+  } catch {
+    return null;
   }
+}
+
+/**
+ * Batch variant of ``fetchImageBlobViaTab`` — sends ALL of a
+ * chapter's image URLs to the bypass tab in a single executeScript
+ * call, lets the page fetch them in parallel, and ships every blob
+ * back at once. Much faster than 18 separate executeScript calls.
+ *
+ * Returns array of ``{ blob | null, error | null }`` in input order
+ * so the caller can match results to URLs.
+ */
+async function fetchAllImagesViaBypassTab(imageUrls) {
+  if (bypassTabId === null || imageUrls.length === 0) {
+    return imageUrls.map(() => ({ blob: null, error: "no bypass tab" }));
+  }
+  let payload;
+  try {
+    const results = await chrome.scripting.executeScript({
+      target: { tabId: bypassTabId },
+      args: [imageUrls],
+      func: async (urls) => {
+        // Cap concurrency at 6 — too many parallel fetches against a
+        // single CDN host can trigger rate-limit shedding.
+        const PARALLEL = 6;
+        const out = new Array(urls.length);
+        let cursor = 0;
+        async function worker() {
+          while (true) {
+            const i = cursor++;
+            if (i >= urls.length) return;
+            const url = urls[i];
+            try {
+              const r = await fetch(url, { credentials: "include" });
+              if (!r.ok) {
+                out[i] = { error: `HTTP ${r.status}` };
+                continue;
+              }
+              const blob = await r.blob();
+              const buf = await blob.arrayBuffer();
+              const bytes = new Uint8Array(buf);
+              let bin = "";
+              const chunk = 0x8000;
+              for (let j = 0; j < bytes.length; j += chunk) {
+                bin += String.fromCharCode.apply(null, bytes.subarray(j, j + chunk));
+              }
+              out[i] = {
+                base64: btoa(bin),
+                type: blob.type || "image/jpeg",
+              };
+            } catch (err) {
+              out[i] = { error: String(err?.message || err) };
+            }
+          }
+        }
+        await Promise.all(
+          Array.from({ length: Math.min(PARALLEL, urls.length) }, worker),
+        );
+        return out;
+      },
+    });
+    payload = results?.[0]?.result;
+  } catch (err) {
+    return imageUrls.map(() => ({
+      blob: null,
+      error: `executeScript: ${err?.message || err}`,
+    }));
+  }
+  if (!Array.isArray(payload)) {
+    return imageUrls.map(() => ({ blob: null, error: "empty response" }));
+  }
+  return payload.map((entry) => {
+    if (!entry || entry.error) {
+      return { blob: null, error: entry?.error || "unknown" };
+    }
+    const binary = atob(entry.base64);
+    const bytes = new Uint8Array(binary.length);
+    for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+    return {
+      blob: new Blob([bytes], { type: entry.type }),
+      error: null,
+    };
+  });
 }
 
 /** Resolve once Chrome marks the tab as fully loaded, or reject on timeout. */
