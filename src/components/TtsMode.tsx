@@ -495,23 +495,65 @@ export function TtsMode() {
       });
 
       // ── Cache hit (done) — total credit save, no API call needed ──
+      // BUT first verify the cached audio_url is still live. ai33.pro
+      // (like most TTS providers) returns time-limited signed URLs
+      // that expire after a few hours. The task_id, by contrast, stays
+      // valid for ~7 days — so if the URL is dead we transparently
+      // refresh it via getTask(task_id), still without spending a new
+      // credit. Means: cancel a run, come back tomorrow, hit Generate
+      // → guaranteed recovery regardless of how stale the URL got.
       if (cached?.status === "done" && cached.audioUrl) {
-        appendLog(
-          `Line ${lineIndex + 1}/${lines.length}: ⚡ cache hit — reusing audio (no credit used).`,
-        );
-        setLineStates((prev) =>
-          prev.map((s, idx) =>
-            idx === lineIndex
-              ? {
-                  ...s,
-                  status: "done",
-                  taskId: cached!.taskId,
-                  audioUrl: cached!.audioUrl,
-                }
-              : s,
-          ),
-        );
-        return cached.audioUrl;
+        let workingUrl = cached.audioUrl;
+        // Cheap HEAD probe to see if the cached URL is still alive.
+        let urlAlive = false;
+        try {
+          const head = await fetch(cached.audioUrl, { method: "HEAD" });
+          urlAlive = head.ok;
+        } catch {
+          urlAlive = false;
+        }
+        if (!urlAlive && cached.taskId) {
+          appendLog(
+            `Line ${lineIndex + 1}: cached URL expired — refreshing via task ${cached.taskId.slice(0, 8)}… (no credit cost)`,
+          );
+          try {
+            const refreshed = await getTask(config, cached.taskId);
+            if (refreshed.status === "done" && refreshed.metadata?.audio_url) {
+              workingUrl = refreshed.metadata.audio_url;
+              updateCachedTask(fp, {
+                audioUrl: workingUrl,
+                lastCheckedAt: Date.now(),
+              });
+              urlAlive = true;
+            }
+          } catch (err) {
+            appendLog(
+              `Line ${lineIndex + 1}: URL refresh failed (${err instanceof Error ? err.message.slice(0, 80) : "unknown"}) — will submit fresh.`,
+            );
+          }
+        }
+        if (urlAlive) {
+          appendLog(
+            `Line ${lineIndex + 1}/${lines.length}: ⚡ cache hit — reusing audio (no credit used).`,
+          );
+          setLineStates((prev) =>
+            prev.map((s, idx) =>
+              idx === lineIndex
+                ? {
+                    ...s,
+                    status: "done",
+                    taskId: cached!.taskId,
+                    audioUrl: workingUrl,
+                  }
+                : s,
+            ),
+          );
+          return workingUrl;
+        }
+        // If we reach here, both the cached URL is dead AND the task
+        // couldn't refresh it. Fall through to fresh submission —
+        // costs one credit, but recovers a chapter that would
+        // otherwise be permanently broken.
       }
 
       // ── Cache hit (pending) — try to recover the old task first ──
