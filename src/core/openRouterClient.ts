@@ -172,13 +172,27 @@ async function downscaleForOpenRouter(
 async function buildMessages(
   prompt: string,
   images?: Blob[],
+  modelId?: string,
 ): Promise<Message[]> {
   if (!images || images.length === 0) {
     return [{ role: "user", content: prompt }];
   }
 
+  // Provider-specific sizing. Alibaba (Qwen3.x-Flash) enforces a
+  // 30 MB per-request cap that forced us to ship tiny thumbnails;
+  // Google's Gemini route has no such cap (their vision tower
+  // accepts up to 1 MB per image at higher quality), so when the
+  // user pinned a google/* model we relax to the same 768 px /
+  // quality 0.85 the rest of the pipeline uses for Gemini direct.
+  // Anthropic Claude is similar — accepts larger images.
+  const isGemini = (modelId ?? "").startsWith("google/");
+  const isClaude = (modelId ?? "").startsWith("anthropic/");
+  const relaxed = isGemini || isClaude;
+
   // Pick initial sizing tier from panel count, then verify post-encode.
-  let { maxEdge, quality } = sizingForImageCount(images.length);
+  let { maxEdge, quality } = relaxed
+    ? { maxEdge: 768, quality: 0.85 } // Gemini / Claude — full fidelity
+    : sizingForImageCount(images.length); // Qwen — Alibaba-safe tiers
   let downscaled = await Promise.all(
     images.map((b) => downscaleForOpenRouter(b, maxEdge, quality)),
   );
@@ -275,7 +289,7 @@ export async function callOpenRouter(
   rotator: KeyRotator,
   opts: OpenRouterCallOptions,
 ): Promise<string> {
-  const messages = await buildMessages(opts.prompt, opts.images);
+  const messages = await buildMessages(opts.prompt, opts.images, opts.model);
   const body: OpenRouterRequest = {
     model: opts.model,
     messages,

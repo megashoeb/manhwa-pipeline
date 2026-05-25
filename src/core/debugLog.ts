@@ -144,12 +144,21 @@ class DebugLog {
 export const debugLog = new DebugLog();
 
 // Hydrate the enabled flag from localStorage so it survives reloads.
+// Default is now ON — when the user runs into an issue, the next
+// thing they'd do is flip the toggle anyway, and the ring buffer
+// keeps capturing in either state. Console mirror cost is negligible.
+// User can still flip it OFF via the panel checkbox.
 try {
   if (typeof localStorage !== "undefined") {
-    debugLog.enabled = localStorage.getItem("manhwa.debug.enabled") === "1";
+    const stored = localStorage.getItem("manhwa.debug.enabled");
+    // First-time visitors (stored === null) get debug ON. Users who
+    // explicitly turned it off (stored === "0") keep it off.
+    debugLog.enabled = stored === null ? true : stored === "1";
+  } else {
+    debugLog.enabled = true;
   }
 } catch {
-  /* ignore */
+  debugLog.enabled = true;
 }
 
 // ---- Perf analysis helpers ----------------------------------------

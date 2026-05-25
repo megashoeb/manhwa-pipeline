@@ -5,6 +5,35 @@ import clsx from "clsx";
 import type { KeyRotator } from "../core/keyRotator";
 import { maskKey } from "../core/geminiClient";
 
+/**
+ * Quick-pick model presets for OpenRouter keys. Maps human-readable
+ * preset name → exact OpenRouter model id. Updating modelOverride
+ * with one of these values pins the entire pipeline to that model.
+ *
+ * "auto" = empty modelOverride → fall back to OPENROUTER_MODEL_MAP
+ * (which currently points all Gemini stage names at Qwen3.5-Flash).
+ *
+ * "custom" = sentinel; UI shows a text input for arbitrary model ids.
+ */
+const MODEL_PRESETS: Record<string, string> = {
+  auto: "",
+  "gemini-2.5-flash": "google/gemini-2.5-flash",
+  "gemini-2.5-flash-lite": "google/gemini-2.5-flash-lite",
+  "qwen3-235b": "qwen/qwen3-235b-a22b-instruct-2507",
+  "claude-haiku-4": "anthropic/claude-haiku-4",
+};
+
+/** Reverse lookup — figure out which preset matches an existing
+ *  modelOverride value, so the dropdown shows the right selection
+ *  when the user reopens the panel. */
+function detectPreset(modelOverride: string | undefined): string {
+  if (!modelOverride) return "auto";
+  for (const [name, id] of Object.entries(MODEL_PRESETS)) {
+    if (id && id === modelOverride) return name;
+  }
+  return "custom";
+}
+
 interface Props {
   rotator: KeyRotator;
 }
@@ -238,6 +267,39 @@ export function ApiKeyManager({ rotator }: Props) {
                     <option value="primary">Primary</option>
                     <option value="backup">Backup</option>
                   </select>
+                  {/* Model preset (OpenRouter only) — quick-pick for
+                      the most useful models. "Auto" leaves modelOverride
+                      empty so the OPENROUTER_MODEL_MAP picks
+                      Qwen3.5-Flash by default. Other presets pin a
+                      specific model id. Custom = user types whatever
+                      they want in the input field that appears.
+                      Hidden for Gemini-provider keys (irrelevant). */}
+                  {k.provider === "openrouter" && (
+                    <select
+                      value={detectPreset(k.modelOverride)}
+                      onChange={(e) => {
+                        const preset = e.target.value;
+                        const newOverride = MODEL_PRESETS[preset] ?? "";
+                        rotator.update(k.value, {
+                          modelOverride: preset === "custom" ? (k.modelOverride || "") : newOverride,
+                        });
+                      }}
+                      className={clsx(
+                        "rounded border bg-zinc-950 px-1.5 py-0.5 text-[10px] font-semibold uppercase tracking-wide",
+                        k.modelOverride
+                          ? "border-emerald-500/60 text-emerald-300"
+                          : "border-zinc-700 text-zinc-400",
+                      )}
+                      title="Quick-pick OpenRouter model. Auto = Qwen3.5-Flash (cheapest). Gemini 2.5 Flash = best reliability + quality."
+                    >
+                      <option value="auto">Auto (Qwen-Flash)</option>
+                      <option value="gemini-2.5-flash">Gemini 2.5 Flash ★</option>
+                      <option value="gemini-2.5-flash-lite">Gemini 2.5 Flash Lite</option>
+                      <option value="qwen3-235b">Qwen3-235B Instruct</option>
+                      <option value="claude-haiku-4">Claude Haiku 4</option>
+                      <option value="custom">Custom…</option>
+                    </select>
+                  )}
                   <div
                     className={clsx(
                       "text-xs tabular-nums",
@@ -264,6 +326,44 @@ export function ApiKeyManager({ rotator }: Props) {
                   </button>
                 </div>
               </div>
+              {/* Custom model input — only when preset = "Custom" or
+                  override doesn't match any preset. Lets the user paste
+                  any OpenRouter model id (e.g.
+                  "qwen/qwen3-vl-30b-a3b-instruct"). */}
+              {k.provider === "openrouter" &&
+                detectPreset(k.modelOverride) === "custom" && (
+                  <div className="mt-2 flex items-center gap-2 text-[11px]">
+                    <span className="text-zinc-500">Model id:</span>
+                    <input
+                      type="text"
+                      value={k.modelOverride ?? ""}
+                      onChange={(e) =>
+                        rotator.update(k.value, {
+                          modelOverride: e.target.value,
+                        })
+                      }
+                      placeholder="e.g. google/gemini-2.5-flash"
+                      className="flex-1 rounded border border-zinc-700 bg-zinc-950 px-2 py-1 font-mono text-[10px] text-zinc-100 placeholder-zinc-600 focus:border-emerald-500 focus:outline-none"
+                    />
+                    <a
+                      href="https://openrouter.ai/models"
+                      target="_blank"
+                      rel="noreferrer"
+                      className="text-emerald-400 hover:text-emerald-300"
+                      title="Browse OpenRouter model catalog"
+                    >
+                      browse →
+                    </a>
+                  </div>
+                )}
+              {/* Active-model hint — show which model this key will
+                  actually use, so it's obvious at a glance. */}
+              {k.provider === "openrouter" && k.modelOverride && (
+                <div className="mt-1 text-[10px] text-emerald-400/80">
+                  <span className="text-zinc-500">Using:</span>{" "}
+                  <code>{k.modelOverride}</code>
+                </div>
+              )}
               {/* Usage bar — paid keys get a static amber bar (no cap
                   to fill); free keys get the standard red/amber/green
                   fill based on dailyPct. */}
