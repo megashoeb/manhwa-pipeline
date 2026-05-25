@@ -187,6 +187,93 @@ export function BulkMode({ rotator }: Props) {
     );
   }, [items, activeSessions]);
 
+  // Auto-mark already-completed chapters as "done" the moment we
+  // detect a resume match. User uploads the same PDFs → checkpoints
+  // load from IDB → items show ✓ next to done ones → Run button text
+  // updates to "Resume queue (N remaining)" automatically. No
+  // separate Resume click required.
+  //
+  // Tracked per (sessionId, currentItemCount) so we only run the
+  // mark-done pass ONCE per detected match, not on every render.
+  const lastAppliedResumeRef = useRef<string | null>(null);
+  useEffect(() => {
+    if (!matchingSession) return;
+    const key = `${matchingSession.meta.id}::${items.length}`;
+    if (lastAppliedResumeRef.current === key) return;
+    lastAppliedResumeRef.current = key;
+
+    let cancelled = false;
+    (async () => {
+      try {
+        const checkpoints = await loadCheckpoints(matchingSession.meta.id);
+        if (cancelled || checkpoints.size === 0) return;
+        setItems((prev) => {
+          const fps = matchingSession.meta.pdfFingerprints;
+          // For each queued item, find its position in the saved
+          // fingerprint order — that's the chapter index the
+          // checkpoint was keyed by.
+          return prev.map((it) => {
+            if (it.status === "done") return it;
+            const indexInSession = fps.findIndex(
+              (fp) => fp.name === it.file.name && fp.size === it.file.size,
+            );
+            const cp =
+              indexInSession >= 0
+                ? checkpoints.get(indexInSession + 1)
+                : undefined;
+            if (cp) {
+              return {
+                file: it.file,
+                status: "done" as const,
+                stage: "done" as const,
+                keptCount: cp.blobs.length,
+                lineCount: cp.script.lines.length,
+                finishedAt: matchingSession.meta.startedAt,
+              };
+            }
+            return it;
+          });
+        });
+      } catch (err) {
+        console.warn("Failed to auto-mark resumed chapters:", err);
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [matchingSession, items.length]);
+
+  // Inverse case — user uploaded a FRESH batch (no matching session).
+  // The previous master bible (from a different series) would pollute
+  // the new run's character names. Auto-clear it the FIRST TIME items
+  // are added without a session match, then mark this batch as "bible
+  // reset already" so we don't keep clearing every time the user
+  // adds more PDFs to the same fresh batch.
+  const bibleResetForBatchRef = useRef<string | null>(null);
+  useEffect(() => {
+    if (items.length === 0) {
+      bibleResetForBatchRef.current = null;
+      return;
+    }
+    if (matchingSession) return; // resume — keep bible
+    // Build a stable batch-key from the first PDF's fingerprint —
+    // good enough to avoid double-resetting when the user adds more
+    // files mid-pick.
+    const firstFp = fingerprintFile(items[0].file);
+    const batchKey = `${firstFp.name}::${firstFp.size}`;
+    if (bibleResetForBatchRef.current === batchKey) return;
+    bibleResetForBatchRef.current = batchKey;
+
+    const existing = loadMasterBible();
+    const hadAny = Object.keys(existing.characters || {}).length > 0;
+    if (hadAny) {
+      clearMasterBible();
+      console.log(
+        "[BulkMode] Fresh batch detected (no matching session) — master bible auto-reset.",
+      );
+    }
+  }, [items, matchingSession]);
+
   const discardSession = useCallback(
     async (sessionId: string) => {
       if (
@@ -867,7 +954,12 @@ export function BulkMode({ rotator }: Props) {
             {!busy ? (
               <button
                 type="button"
-                onClick={() => start()}
+                // Auto-pass the matched session id when the queued PDFs
+                // fingerprint-match an incomplete run. The user no
+                // longer needs to find + click the Resume banner — they
+                // just drop the same PDFs, hit Start, and we transparently
+                // continue from the last completed chapter.
+                onClick={() => start(matchingSession?.meta.id)}
                 disabled={!hasAnyKey || items.length === 0}
                 className="flex items-center gap-2 rounded bg-emerald-600 px-4 py-2 text-sm font-semibold text-white hover:bg-emerald-500 disabled:cursor-not-allowed disabled:bg-zinc-700 disabled:text-zinc-400"
               >
