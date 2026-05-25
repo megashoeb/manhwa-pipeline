@@ -98,7 +98,34 @@ export function BulkMode({ rotator }: Props) {
     readJson<boolean>("manhwa.bulk.parallelChapters", true),
   );
 
-  // Persist the two toggles whenever they change so a user who turns
+  // ---- Global polish settings -----------------------------------
+  // ONE extra Gemini call after all chapters + bridges complete that
+  // removes repeated hooks, applies a style seed, and validates
+  // names+line-count before replacing the raw script. On any failure
+  // the raw script is used transparently. Costs ~Rs 1.25/video and
+  // adds ~3-4 min to a 50-chapter run.
+  const [polishEnabled, setPolishEnabled] = useState<boolean>(() =>
+    readJson<boolean>("manhwa.bulk.polishEnabled", true),
+  );
+  const [polishStyle, setPolishStyle] = useState<string>(() =>
+    readJson<string>("manhwa.bulk.polishStyle", "auto"),
+  );
+  const [polishPacing, setPolishPacing] = useState<string>(() =>
+    readJson<string>("manhwa.bulk.polishPacing", "auto"),
+  );
+  const [polishHookVariety, setPolishHookVariety] = useState<string>(() =>
+    readJson<string>("manhwa.bulk.polishHookVariety", "high"),
+  );
+  /** Outcome of the most recent polish attempt — used to render a status
+   *  badge on the output card. ``null`` until a run finishes. */
+  const [polishResult, setPolishResult] = useState<{
+    applied: boolean;
+    fallbackReason?: string;
+    resolvedStyle: string;
+    resolvedPacing: string;
+  } | null>(null);
+
+  // Persist the toggles whenever they change so a user who turns
   // one off sees it stay off on the next reload.
   useEffect(() => {
     writeJson("manhwa.bulk.longFormRecap", longFormRecap);
@@ -106,6 +133,18 @@ export function BulkMode({ rotator }: Props) {
   useEffect(() => {
     writeJson("manhwa.bulk.parallelChapters", parallelChapters);
   }, [parallelChapters]);
+  useEffect(() => {
+    writeJson("manhwa.bulk.polishEnabled", polishEnabled);
+  }, [polishEnabled]);
+  useEffect(() => {
+    writeJson("manhwa.bulk.polishStyle", polishStyle);
+  }, [polishStyle]);
+  useEffect(() => {
+    writeJson("manhwa.bulk.polishPacing", polishPacing);
+  }, [polishPacing]);
+  useEffect(() => {
+    writeJson("manhwa.bulk.polishHookVariety", polishHookVariety);
+  }, [polishHookVariety]);
   // Last successful combined-ZIP blob — populated after each long-form
   // run completes, so the user can re-download the archive without
   // re-running the queue. Cleared when a new run starts so the button
@@ -623,6 +662,7 @@ export function BulkMode({ rotator }: Props) {
       }
     }
 
+    setPolishResult(null);
     await runBulkQueue({
       files: queueFiles,
       rotator,
@@ -638,6 +678,34 @@ export function BulkMode({ rotator }: Props) {
         longFormRecap && addToSeries && selectedSeriesId
           ? selectedSeriesId
           : undefined,
+      // Global polish stage — strips repeated hooks + applies style.
+      globalPolish: polishEnabled
+        ? {
+            enabled: true,
+            styleSeed: polishStyle as
+              | "auto"
+              | "dark-gritty"
+              | "epic-mythic"
+              | "punchy-action"
+              | "introspective"
+              | "cinematic",
+            pacing: polishPacing as
+              | "auto"
+              | "slow-build"
+              | "fast-throughout"
+              | "cold-open"
+              | "wave",
+            hookVariety: polishHookVariety as "low" | "medium" | "high",
+          }
+        : undefined,
+      onPolishResult: (r) => {
+        setPolishResult({
+          applied: r.applied,
+          fallbackReason: r.fallbackReason,
+          resolvedStyle: r.resolvedStyle,
+          resolvedPacing: r.resolvedPacing,
+        });
+      },
       onItemUpdate: (queueIdx, patch) => {
         const realIdx = indexMap.get(queueFiles[queueIdx]);
         if (realIdx == null) return;
@@ -913,6 +981,128 @@ export function BulkMode({ rotator }: Props) {
               chapterCount={items.length}
             />
           </div>
+          {/* Global script polish — runs at the END of the pipeline
+              over the assembled multi-chapter script. Removes
+              repeated hooks + applies a per-video style seed. */}
+          {longFormRecap && (
+            <div className="mt-3 rounded-lg border border-amber-700/30 bg-amber-950/10 p-3">
+              <label className="flex cursor-pointer items-start gap-2">
+                <input
+                  type="checkbox"
+                  checked={polishEnabled}
+                  onChange={(e) => setPolishEnabled(e.target.checked)}
+                  disabled={busy}
+                  className="mt-0.5 h-4 w-4 accent-amber-500"
+                />
+                <div className="flex-1">
+                  <div className="text-sm font-semibold text-amber-200">
+                    ✨ Final polish pass (recommended)
+                  </div>
+                  <div className="mt-0.5 text-[11px] leading-relaxed text-zinc-400">
+                    After all chapters + bridges are done, run ONE
+                    Gemini 2.5 Flash Lite call over the full assembled
+                    script. Removes repeated hooks (
+                    <code className="text-amber-300/80">
+                      "What if the weakest son…"
+                    </code>{" "}
+                    × 16 → varied openings), applies a per-video style.
+                    Falls back to raw script on any validation failure.{" "}
+                    <span className="text-emerald-400/80">
+                      ~3-4 min extra + ~Rs 1.25/video
+                    </span>
+                    .
+                  </div>
+                </div>
+              </label>
+              {polishEnabled && (
+                <div className="mt-3 grid grid-cols-1 gap-2 pl-6 sm:grid-cols-3">
+                  <div>
+                    <label className="mb-1 block text-[10px] font-medium uppercase tracking-wider text-zinc-500">
+                      Style seed
+                    </label>
+                    <select
+                      value={polishStyle}
+                      onChange={(e) => setPolishStyle(e.target.value)}
+                      disabled={busy}
+                      className="w-full rounded border border-zinc-700 bg-zinc-950 px-2 py-1 text-[11px] text-zinc-100 focus:border-amber-500 focus:outline-none disabled:opacity-50"
+                    >
+                      <option value="auto">Auto (random per video) ★</option>
+                      <option value="dark-gritty">Dark Gritty</option>
+                      <option value="epic-mythic">Epic Mythic</option>
+                      <option value="punchy-action">Punchy Action</option>
+                      <option value="introspective">Introspective</option>
+                      <option value="cinematic">Cinematic</option>
+                    </select>
+                  </div>
+                  <div>
+                    <label className="mb-1 block text-[10px] font-medium uppercase tracking-wider text-zinc-500">
+                      Pacing
+                    </label>
+                    <select
+                      value={polishPacing}
+                      onChange={(e) => setPolishPacing(e.target.value)}
+                      disabled={busy}
+                      className="w-full rounded border border-zinc-700 bg-zinc-950 px-2 py-1 text-[11px] text-zinc-100 focus:border-amber-500 focus:outline-none disabled:opacity-50"
+                    >
+                      <option value="auto">Auto ★</option>
+                      <option value="slow-build">Slow build → payoff</option>
+                      <option value="fast-throughout">Fast throughout</option>
+                      <option value="cold-open">
+                        Cold open (mid-action start)
+                      </option>
+                      <option value="wave">Wave (up-down-up)</option>
+                    </select>
+                  </div>
+                  <div>
+                    <label className="mb-1 block text-[10px] font-medium uppercase tracking-wider text-zinc-500">
+                      Hook variety
+                    </label>
+                    <select
+                      value={polishHookVariety}
+                      onChange={(e) => setPolishHookVariety(e.target.value)}
+                      disabled={busy}
+                      className="w-full rounded border border-zinc-700 bg-zinc-950 px-2 py-1 text-[11px] text-zinc-100 focus:border-amber-500 focus:outline-none disabled:opacity-50"
+                    >
+                      <option value="high">High (every chapter unique) ★</option>
+                      <option value="medium">Medium (3-4 variations)</option>
+                      <option value="low">Low (1-2 variations)</option>
+                    </select>
+                  </div>
+                </div>
+              )}
+              {/* Status badge after a completed run */}
+              {polishResult && (
+                <div
+                  className={clsx(
+                    "mt-3 rounded px-2 py-1.5 text-[11px]",
+                    polishResult.applied
+                      ? "bg-emerald-950/40 text-emerald-300"
+                      : "bg-red-950/40 text-red-300",
+                  )}
+                >
+                  {polishResult.applied ? (
+                    <>
+                      ✅ Polish applied — style:{" "}
+                      <span className="font-semibold">
+                        {polishResult.resolvedStyle}
+                      </span>
+                      , pacing:{" "}
+                      <span className="font-semibold">
+                        {polishResult.resolvedPacing}
+                      </span>
+                    </>
+                  ) : (
+                    <>
+                      ❌ Polish skipped (raw script used). Reason:{" "}
+                      <span className="text-zinc-400">
+                        {polishResult.fallbackReason}
+                      </span>
+                    </>
+                  )}
+                </div>
+              )}
+            </div>
+          )}
         </Section>
       )}
 
