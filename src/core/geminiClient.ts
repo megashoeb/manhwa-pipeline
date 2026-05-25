@@ -14,6 +14,7 @@ import {
   OPENROUTER_DEFAULT_MODEL,
   OPENROUTER_MODEL_MAP,
 } from "./modelTiers";
+import { debugLog } from "./debugLog";
 
 const ENDPOINT = "https://generativelanguage.googleapis.com/v1beta/models";
 
@@ -117,6 +118,13 @@ export async function generateContent(
   if (opts.topP != null) generationConfig.topP = opts.topP;
   if (opts.responseMimeType)
     generationConfig.responseMimeType = opts.responseMimeType;
+  // Cap output — Gemini's param is ``maxOutputTokens`` (vs OpenAI's
+  // ``max_tokens``). Same 6144 cap we set on the OpenRouter side so
+  // both providers stop generating around the same length. Without
+  // this, Gemini occasionally runs to its full 8192-token default on
+  // prompts that should produce ~2K tokens — slower + costs more.
+  // 6144 is plenty for whole-chapter narration (~4000 spoken words).
+  generationConfig.maxOutputTokens = 6144;
 
   // Disable Google's content safety filters wherever the API lets us.
   // Manhwa narratives routinely depict combat, blood, character death,
@@ -251,6 +259,20 @@ async function callWithRetries(
 
     opts.onKeyUsed?.(maskKey(apiKey));
 
+    // Stamp the call in the debug log so the panel can show every
+    // Gemini request alongside OpenRouter requests with matching shape.
+    const callStartedAt = Date.now();
+    debugLog.push({
+      type: "api-call",
+      label: `gemini ${modelId}`,
+      context: {
+        attempt: attempt + 1,
+        jsonMode: opts.responseMimeType === "application/json",
+        imageCount: opts.images?.length ?? 0,
+        key: maskKey(apiKey),
+      },
+    });
+
     let response: Response;
     // AbortController + setTimeout guarantees a stuck fetch can't hang
     // the worker forever. If the timeout fires we treat it as a network
@@ -277,6 +299,13 @@ async function callWithRetries(
         const delay = backoffMs(attempt);
         const isTimeout =
           e instanceof Error && e.name === "AbortError";
+        debugLog.push({
+          type: "api-error",
+          label: `gemini ${modelId} → ${isTimeout ? "timeout" : "network error"}`,
+          durationMs: Date.now() - callStartedAt,
+          context: { attempt: attempt + 1, willRetry: true },
+          detail: e instanceof Error ? e.message : String(e),
+        });
         console.warn(
           `Gemini ${isTimeout ? "timeout" : "network error"} on attempt ` +
             `${attempt + 1}/${MAX_ATTEMPTS} (${modelId}), retrying in ${delay / 1000}s …`,
@@ -294,6 +323,12 @@ async function callWithRetries(
       // one IMMEDIATELY — no backoff needed if a fresh key is free.
       rotator.recordRateLimit(apiKey);
       lastErr = new GeminiError("Rate limited", 429);
+      debugLog.push({
+        type: "api-error",
+        label: `gemini ${modelId} → HTTP 429 rate-limited`,
+        durationMs: Date.now() - callStartedAt,
+        context: { attempt: attempt + 1, key: maskKey(apiKey) },
+      });
       continue;
     }
 
@@ -304,6 +339,15 @@ async function callWithRetries(
         `Gemini API HTTP ${response.status} (server temporarily unavailable)`,
         response.status,
       );
+      debugLog.push({
+        type: "api-error",
+        label: `gemini ${modelId} → HTTP ${response.status}`,
+        durationMs: Date.now() - callStartedAt,
+        context: {
+          attempt: attempt + 1,
+          willRetry: attempt < MAX_ATTEMPTS - 1,
+        },
+      });
       if (attempt < MAX_ATTEMPTS - 1) {
         const delay = backoffMs(attempt);
         console.warn(
@@ -319,6 +363,13 @@ async function callWithRetries(
       // 4xx errors are caller errors (bad request, bad key, blocked).
       // Don't retry — surface the problem clearly to the user.
       const detail = await safeText(response);
+      debugLog.push({
+        type: "api-error",
+        label: `gemini ${modelId} → HTTP ${response.status}`,
+        durationMs: Date.now() - callStartedAt,
+        context: { status: response.status, attempt: attempt + 1 },
+        detail: detail.slice(0, 600),
+      });
       throw new GeminiError(
         `Gemini API HTTP ${response.status}`,
         response.status,
@@ -336,6 +387,13 @@ async function callWithRetries(
       // status so the outer fallback handler routes to a different
       // model (sometimes flash-lite blocks where flash-preview doesn't,
       // and vice versa).
+      debugLog.push({
+        type: "api-error",
+        label: `gemini ${modelId} → safety block (no candidates)`,
+        durationMs: Date.now() - callStartedAt,
+        context: { attempt: attempt + 1 },
+        detail: JSON.stringify(data).slice(0, 600),
+      });
       throw new GeminiError(
         "Gemini returned no candidates (prompt likely blocked by safety filter).",
         -2,
@@ -343,6 +401,13 @@ async function callWithRetries(
       );
     }
     if (candidate.finishReason === "SAFETY") {
+      debugLog.push({
+        type: "api-error",
+        label: `gemini ${modelId} → SAFETY finishReason`,
+        durationMs: Date.now() - callStartedAt,
+        context: { attempt: attempt + 1 },
+        detail: JSON.stringify(candidate.safetyRatings).slice(0, 600),
+      });
       throw new GeminiError(
         "Response blocked by Gemini's safety filter. " +
           "Even with BLOCK_NONE thresholds, Google enforces a non-overridable hard filter for certain content. " +
@@ -357,12 +422,31 @@ async function callWithRetries(
       .join("")
       .trim();
     if (!text) {
+      debugLog.push({
+        type: "api-error",
+        label: `gemini ${modelId} → empty response`,
+        durationMs: Date.now() - callStartedAt,
+        context: { attempt: attempt + 1 },
+      });
       throw new GeminiError(
         "Empty response text from Gemini.",
         0,
         JSON.stringify(data).slice(0, 800),
       );
     }
+    // Success — log with token usage if Gemini returned a usageMetadata
+    // block (newer models do, older ones may not).
+    debugLog.push({
+      type: "api-success",
+      label: `gemini ${modelId}`,
+      durationMs: Date.now() - callStartedAt,
+      context: {
+        inputTokens: data.usageMetadata?.promptTokenCount,
+        outputTokens: data.usageMetadata?.candidatesTokenCount,
+        totalTokens: data.usageMetadata?.totalTokenCount,
+        attempt: attempt + 1,
+      },
+    });
     return text;
   }
 
@@ -378,6 +462,16 @@ interface GeminiResponse {
     finishReason?: string;
     safetyRatings?: unknown[];
   }>;
+  /**
+   * Token-count metadata. Newer Gemini models always return this.
+   * Older ones (gemini-1.x) may omit it — debug log treats those as
+   * "unknown token usage" and just skips the field.
+   */
+  usageMetadata?: {
+    promptTokenCount?: number;
+    candidatesTokenCount?: number;
+    totalTokenCount?: number;
+  };
 }
 
 async function blobToBase64(blob: Blob): Promise<string> {
