@@ -374,15 +374,41 @@ export async function callOpenRouter(
     }
 
     if (SERVER_ERROR_STATUSES.has(response.status)) {
+      // Peek at the body to detect the specific "Failed to download
+      // multimodal content" error Alibaba's gateway returns when its
+      // image-handling service is having an upstream hiccup. That one
+      // benefits from longer backoff (the outage typically clears in
+      // 30-60 sec) and slightly more attempts than the 2-cap defaults.
+      let detailPreview = "";
+      try {
+        const clone = response.clone();
+        detailPreview = (await clone.text()).slice(0, 400);
+      } catch {
+        /* ignore — body might be already consumed */
+      }
+      const isAlibabaMultimodalGlitch =
+        /Failed to download multimodal content|InternalError\.Algo\.InvalidParameter/i.test(
+          detailPreview,
+        );
       lastErr = new OpenRouterError(
         `OpenRouter HTTP ${response.status} (server temporarily unavailable)`,
         response.status,
+        detailPreview,
       );
-      if (attempt < MAX_ATTEMPTS - 1) {
-        const delay = backoffMs(attempt);
+      // For the Alibaba multimodal-download glitch, use a longer
+      // backoff (3s / 8s / 15s) instead of the default 1s / 2s
+      // because the upstream service needs more time to recover.
+      // Also give it 1 extra attempt beyond MAX_ATTEMPTS.
+      const effectiveMax = isAlibabaMultimodalGlitch
+        ? MAX_ATTEMPTS + 1
+        : MAX_ATTEMPTS;
+      if (attempt < effectiveMax - 1) {
+        const delay = isAlibabaMultimodalGlitch
+          ? [3000, 8000, 15000][attempt] ?? 15000
+          : backoffMs(attempt);
         console.warn(
-          `OpenRouter ${response.status} server error (attempt ` +
-            `${attempt + 1}/${MAX_ATTEMPTS}) — retrying in ${delay / 1000}s…`,
+          `OpenRouter ${response.status} ${isAlibabaMultimodalGlitch ? "(Alibaba multimodal glitch)" : "server error"} ` +
+            `(attempt ${attempt + 1}/${effectiveMax}) — retrying in ${delay / 1000}s…`,
         );
         await sleep(delay);
       }
