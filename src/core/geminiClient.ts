@@ -46,6 +46,13 @@ export interface GenerateOptions {
   topP?: number;
   /** Hook for the UI to log which key handled the call (post-pick). */
   onKeyUsed?: (maskedKey: string) => void;
+  /**
+   * Override the default 6144 output-token cap. Used by stages that
+   * legitimately need to produce much longer output than a normal
+   * pipeline call — the global polish pass over a 1500-line script
+   * needs ~25K output tokens to round-trip correctly, for example.
+   */
+  maxOutputTokens?: number;
 }
 
 export class GeminiError extends Error {
@@ -124,7 +131,9 @@ export async function generateContent(
   // this, Gemini occasionally runs to its full 8192-token default on
   // prompts that should produce ~2K tokens — slower + costs more.
   // 6144 is plenty for whole-chapter narration (~4000 spoken words).
-  generationConfig.maxOutputTokens = 6144;
+  // Callers like the global polish stage override via opts.maxOutputTokens
+  // because they legitimately need 25K+ tokens of output.
+  generationConfig.maxOutputTokens = opts.maxOutputTokens ?? 6144;
 
   // Disable Google's content safety filters wherever the API lets us.
   // Manhwa narratives routinely depict combat, blood, character death,
@@ -236,6 +245,7 @@ async function callWithRetries(
           temperature: opts.temperature,
           topP: opts.topP,
           onKeyUsed: opts.onKeyUsed,
+          maxOutputTokens: opts.maxOutputTokens,
         });
       } catch (e) {
         // OpenRouter failure — translate to GeminiError shape so the

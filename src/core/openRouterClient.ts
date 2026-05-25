@@ -271,6 +271,13 @@ export interface OpenRouterCallOptions {
   topP?: number;
   /** Hook for the UI to log which key handled the call. */
   onKeyUsed?: (maskedKey: string) => void;
+  /**
+   * Override the default 6144 output-token cap. Used by stages that
+   * legitimately need to produce much longer output — e.g. the global
+   * polish pass over a 1500-line script needs ~25K output tokens to
+   * round-trip correctly.
+   */
+  maxOutputTokens?: number;
 }
 
 function maskKey(k: string): string {
@@ -314,7 +321,7 @@ export async function callOpenRouter(
   // came back when max_tokens=8192). Setting both fixes the runaway.
   // 6K is enough for whole-chapter narration; structured output
   // stages (curator, segment) need way less.
-  const cap = body.max_tokens ?? 6144;
+  const cap = body.max_tokens ?? opts.maxOutputTokens ?? 6144;
   body.max_tokens = cap;
   body.max_completion_tokens = cap;
 

@@ -83,7 +83,11 @@ export interface GlobalPolishResult {
   resolvedPacing: Exclude<PacingPattern, "auto">;
 }
 
-const DEFAULT_POLISH_MODEL = "google/gemini-2.5-flash-lite";
+// Gemini-native name. Works directly when the picked key is a Gemini
+// key. When the picked key is OpenRouter, modelTiers.ts maps this
+// name to "google/gemini-2.5-flash-lite" automatically — so the user
+// gets the right model on either provider.
+const DEFAULT_POLISH_MODEL = "gemini-2.5-flash-lite";
 
 const ALL_STYLE_SEEDS: Exclude<StyleSeed, "auto">[] = [
   "dark-gritty",
@@ -172,6 +176,11 @@ export async function polishScriptGlobally(
       temperature: 0.55,
       topP: 0.9,
       onKeyUsed: opts.onKeyUsed,
+      // A 50-chapter assembled script can hit ~25K output tokens.
+      // Default 6144 cap would truncate the response halfway through,
+      // failing the line-count gate and forcing a fallback. Give
+      // polish 32K so even a 80-chapter run rounds-trips cleanly.
+      maxOutputTokens: 32768,
     });
   } catch (err) {
     const reason =
@@ -320,16 +329,65 @@ function parsePolishedOutput(raw: string): string[] {
 }
 
 const STYLE_INSTRUCTIONS: Record<Exclude<StyleSeed, "auto">, string> = {
-  "dark-gritty":
-    "Short, punchy sentences. Visceral verbs (rips, shatters, bleeds, crumbles). Heavy on consequences and physical detail. Bleak undertone. Example tone: \"Blood. Steel. Silence. He stands alone.\"",
-  "epic-mythic":
-    "Longer flowing prose. Grand vocabulary (legendary, destiny, kingdoms, ancient). Mythological register. Example tone: \"In an age of dying kings, one warrior remembers what others forgot.\"",
-  "punchy-action":
-    "Rapid-fire pacing. Action verbs front-loaded. Heavy use of momentum and forward drive. Example tone: \"He swings. He blocks. He bleeds. He doesn't stop.\"",
-  introspective:
-    "Character POV thoughts threaded in. Internal monologue between actions. Slower, more reflective pace. Example tone: \"He had lived this moment three times before. This time, he wouldn't lose.\"",
-  cinematic:
-    "Visual scene-setting. Camera-angle style descriptions. Atmospheric and movie-like. Example tone: \"The camera pans across a battlefield drowning in mist as he rises one last time.\"",
+  "dark-gritty": `Short, punchy sentences. Visceral verbs (rips, shatters, bleeds, crumbles, splinters, snaps). Heavy on physical consequences — wounds, exhaustion, the weight of damage. Bleak, weary undertone. Show character cost: scarred knuckles, ragged breath, blood pooling.
+
+GOOD examples:
+- "Blood. Steel. Silence. He stands alone."
+- "His grip slips on the hilt. Sweat or blood — he can't tell anymore."
+- "The body falls. He doesn't watch it land."
+
+AVOID:
+- ✗ Heroic flourishes ("magnificent", "glorious")
+- ✗ Soft poetry ("whispers of fate")
+- ✗ Action-movie banter`,
+
+  "epic-mythic": `Longer flowing prose. Elevated vocabulary (legacy, sovereign, ancient, oath, exile, banished, prophesied). Mythological register — feels like a saga being recounted. Use weight-bearing nouns over generic ones (a "kingdom" not "place", a "blade" not "weapon").
+
+GOOD examples:
+- "In an age of dying kings, one warrior remembers what others have buried."
+- "Long after the last bonfire died, his name would still split the silence."
+- "He carries a debt older than the empire he serves."
+
+AVOID:
+- ✗ Modern idioms ("game over", "no way")
+- ✗ Profanity or vulgar slang
+- ✗ Casual contractions in dramatic beats`,
+
+  "punchy-action": `Rapid-fire pacing. Action verbs front-loaded (subject + strong verb in first 3 words). Heavy momentum, no padding. Sentences average 8-14 words. Mix short and medium — never let two long sentences run back-to-back.
+
+GOOD examples:
+- "He swings. The blade meets armor. The armor loses."
+- "Jaxon drives forward, slamming his shoulder into the closing line."
+- "Three soldiers charge. Three soldiers fall. He's already moving past them."
+
+AVOID:
+- ✗ Lengthy character interiority mid-fight
+- ✗ Adjective stacks ("a brutal, devastating, savage strike")
+- ✗ Passive voice ("was struck by")`,
+
+  introspective: `Character POV thoughts threaded in between physical actions. Internal monologue carries motivation and stakes. Slower, reflective pace — but never sleepy. Use rhetorical fragments to mark thoughts: "Three breaths. That's all he had left." Mix action with the character's read of it.
+
+GOOD examples:
+- "He had lived this moment three times before. This time, he wouldn't lose."
+- "Jaxon counted the soldiers. Eight. He'd survived worse with less."
+- "A familiar burn climbed his arm. He welcomed it. Pain meant he was still here."
+
+AVOID:
+- ✗ Pure action with no inner thread
+- ✗ Overlong internal speeches that stall the scene
+- ✗ Telegraphing what's about to happen`,
+
+  cinematic: `Visual scene-setting like a movie. Use light, weather, scale, and movement of perspective. Open shots wide, then push in close on what matters. Atmospheric — convey mood through environment, not just character emotion.
+
+GOOD examples:
+- "The camera pans across a battlefield drowning in mist as he rises one last time."
+- "Frame holds on the empty hilt — then a slow tilt up to find his eyes."
+- "Behind him, the city skyline burns orange. He doesn't turn to look."
+
+AVOID:
+- ✗ Literal "the panel shows" / "we see" meta-language
+- ✗ Generic visual filler ("it was beautiful")
+- ✗ Over-direction every line — pick the right moments`,
 };
 
 const PACING_INSTRUCTIONS: Record<Exclude<PacingPattern, "auto">, string> = {
@@ -398,6 +456,83 @@ HOOK VARIETY — ${hookVariety.toUpperCase()}
 ${HOOK_VARIETY_INSTRUCTIONS[hookVariety]}
 
 ═══════════════════════════════════════════════════════════════════════
+FORBIDDEN PHRASE RULES
+═══════════════════════════════════════════════════════════════════════
+✗ NEVER use "our hero", "our boy", "the heir", "the warrior", "the regressor", "the survivor", "the young mercenary", "our protagonist".
+  Max 1 use TOTAL across entire script for ALL these combined.
+✗ NEVER use full descriptive titles like "The Eternally Regressing Knight" more than 2-3 times in entire script. Use real name ("Jaxon") or "he" instead.
+✗ NEVER use panel-description meta-language: "this chapter", "this scene", "the panel shows", "close-up of", "wide shot", "in the frame".
+
+═══════════════════════════════════════════════════════════════════════
+CHARACTER INTRODUCTION RULE
+═══════════════════════════════════════════════════════════════════════
+When ANY named character appears for the FIRST TIME, attach a 4-7 word context tag explaining who they are:
+BAD:  "Krais raises his axe."
+GOOD: "Krais, Jaxon's loyal ally, raises his axe."
+
+If a character is unnamed in the source (described only by appearance like "blue-skinned warrior"), use a consistent role tag throughout:
+"the Frog-clan champion", "the silent assassin", etc.
+
+After first introduction, use the name or "he/she" only.
+
+═══════════════════════════════════════════════════════════════════════
+ADJECTIVE VARIETY LOCK
+═══════════════════════════════════════════════════════════════════════
+Across entire script, limit these phrases to MAX 2 uses each:
+- "grits teeth" / "gritted teeth"
+- "eyes burn/burning/blazing with defiance"
+- "brutal assault" / "relentless assault"
+- "pushed past limits"
+- "crimson blood splatters"
+- "savage strike/blow"
+- "devastating blow"
+
+Rotate vocabulary aggressively. Use specific verbs over generic intensity words. "He grits his teeth" appearing 6 times = REWRITE 4 of them.
+
+═══════════════════════════════════════════════════════════════════════
+SCENE TRANSITION SIGNPOSTS (mandatory)
+═══════════════════════════════════════════════════════════════════════
+On EVERY time/place jump, prepend a 3-5 word signpost so viewers never get lost:
+- "Years earlier..."
+- "Back in the present..."
+- "Meanwhile, at the camp..."
+- "Cut to the tent..."
+- "Hours after the battle..."
+- "Far from the battlefield..."
+
+A flashback, dream sequence, or POV switch MUST have a marker.
+
+═══════════════════════════════════════════════════════════════════════
+NARRATOR PERSONALITY — WARM, OBSERVANT
+═══════════════════════════════════════════════════════════════════════
+Add ONE light observational aside every 10-12 lines. Tone: like a friend watching alongside the viewer.
+Examples:
+- "And this is where everything begins to shift."
+- "Notice he doesn't even hesitate — that's not luck."
+- "For anyone wondering why he keeps getting up — keep watching."
+
+NEVER use sarcasm at characters. NEVER use Gen-Z memes ("sigma", "rizz", "bro", "ohio"). Keep voice timeless.
+
+═══════════════════════════════════════════════════════════════════════
+STORY-FIRST CONTEXT
+═══════════════════════════════════════════════════════════════════════
+Each line maps to one panel but must carry forward:
+- WHO the character is (use real name, never just "the warrior")
+- WHY they're acting (motivation)
+- WHAT'S AT STAKE (personal — family, honor, revenge, survival)
+
+A non-reader of the manhwa must be able to follow without confusion.
+First 30 lines MUST establish: protagonist name, family situation, power system basics, current threat.
+
+═══════════════════════════════════════════════════════════════════════
+FRAGMENT-SPAM LIMIT
+═══════════════════════════════════════════════════════════════════════
+BAD:  "Blue mana surges. He slides. He won't stop. He grips. He prepares."
+GOOD: "Blue mana surges through him as he slides across the broken concrete, refusing to slow even for a breath."
+
+Max 1 sentence fragment per 5 consecutive lines. Use full sentences with rhythm.
+
+═══════════════════════════════════════════════════════════════════════
 HARD RULES — DO NOT VIOLATE
 ═══════════════════════════════════════════════════════════════════════
 ✓ PRESERVE LINE COUNT EXACTLY: input has ${rawLines.length} lines, output MUST have ${rawLines.length} lines (numbered 1 through ${rawLines.length}). Each input line N maps to output line N.
@@ -408,6 +543,22 @@ ${namesList}
 ✓ Maintain present tense, third person, YouTube manhwa-recap tone (casual but punchy).
 ✓ Each line stays roughly the same length (±30%). Do not summarise. Do not pad.
 ✓ Output ONLY the numbered lines. NO commentary before or after. NO markdown fences.
+
+═══════════════════════════════════════════════════════════════════════
+SELF-CHECK BEFORE OUTPUT
+═══════════════════════════════════════════════════════════════════════
+Before submitting, verify:
+☐ Output line count = input line count (${rawLines.length})
+☐ Hook appears ONLY on line 1 (no repeats anywhere)
+☐ "Our hero" / "our boy" used 0-1 times total
+☐ "The [Long Descriptive Title]" used max 2-3 times
+☐ Every named character has context tag on first mention
+☐ Tense locked to present throughout
+☐ No "this chapter" / "this scene" meta-language
+☐ Scene transitions signposted on every jump
+☐ At least 5-8 narrator asides distributed evenly
+☐ "Grits teeth" / "burning defiance" max 2 uses each
+☐ Output is JUST numbered lines — no commentary
 
 ═══════════════════════════════════════════════════════════════════════
 INPUT — ${rawLines.length} LINES

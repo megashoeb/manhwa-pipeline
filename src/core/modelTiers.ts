@@ -140,6 +140,10 @@ export const OPENROUTER_MODEL_MAP: Record<string, string> = {
   "gemini-3-flash-preview": "qwen/qwen3.5-flash-02-23",
   "gemini-3.1-pro-preview": "qwen/qwen3.6-plus", // step up for premium tier
   "gemini-2.5-pro": "qwen/qwen3.6-plus",
+  // Global polish stage explicitly asks for Gemini 2.5 Flash Lite —
+  // when the picked key is OpenRouter, route to the real Gemini-on-
+  // OpenRouter route so the user gets polish quality, not Qwen.
+  "gemini-2.5-flash-lite": "google/gemini-2.5-flash-lite",
 };
 
 /** Default OpenRouter model when no mapping exists for the requested Gemini model. */
