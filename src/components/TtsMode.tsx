@@ -63,12 +63,13 @@ const STORAGE_KEY_CACHE = "manhwa.tts.lineCache";
 // need maximum quality can still pick multilingual_v2 from the dropdown.
 const DEFAULT_MODEL = "eleven_turbo_v2_5";
 
-// Retry config for transient failures. ai33.pro aggregator does
-// occasionally hang specific workers — a fresh task usually clears it.
-// Backoffs are aggressive (2s/4s/8s) because at concurrency >= 5 we
-// often have other lines completing in the same window — a long retry
-// pause leaves a worker idle while siblings finish.
-const MAX_LINE_ATTEMPTS = 3;
+// MAX_LINE_ATTEMPTS = 1 → AUTO-retry disabled per user request.
+// If a line fails (create timeout, poll timeout, network error, parse
+// error, anything), it's marked FAILED immediately and the batch moves
+// on. The user-driven "Retry failed" button still re-runs failed
+// lines on demand — that's manual, not automatic. RETRY_BACKOFF_MS
+// kept for backward compat but unused when MAX_LINE_ATTEMPTS = 1.
+const MAX_LINE_ATTEMPTS = 1;
 const RETRY_BACKOFF_MS = 2000;
 
 // Parallel worker count for the TTS batch loop. Default 5 = 5 lines
@@ -819,7 +820,7 @@ export function TtsMode() {
               ),
             );
             appendLog(
-              `Line ${i + 1}: ✗ all ${MAX_LINE_ATTEMPTS} attempts failed — pool will continue with next line.`,
+              `Line ${i + 1}: ✗ failed — pool will continue. Use "Retry failed" button after the batch.`,
             );
             failedIndices.push(i);
           }
@@ -1522,10 +1523,11 @@ export function TtsMode() {
             )}
           </div>
           <div className="text-[11px] text-zinc-500">
-            One failed line no longer kills the batch — processing continues,
-            and each line auto-retries up to {MAX_LINE_ATTEMPTS}× before being
-            marked failed. Task IDs are persisted so credits are recoverable
-            even after a crash.
+            One failed line no longer kills the batch — processing
+            continues to the next line. <strong>Auto-retry is OFF</strong>{" "}
+            (per user setting): a stuck line fails fast and waits for you
+            to click <em>Retry failed</em> below. Task IDs are persisted so
+            credits are recoverable even after a crash or browser close.
           </div>
           {lineCache.length > 0 && (
             <div className="flex items-center justify-between gap-2 rounded border border-zinc-800 bg-zinc-950/40 px-2 py-1 text-[11px] text-zinc-500">
