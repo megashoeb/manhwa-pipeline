@@ -290,11 +290,11 @@ export function ApiKeyManager({ rotator }: Props) {
                           ? "border-emerald-500/60 text-emerald-300"
                           : "border-zinc-700 text-zinc-400",
                       )}
-                      title="Quick-pick OpenRouter model. Auto = Qwen3.5-Flash (cheapest). Gemini 2.5 Flash = best reliability + quality."
+                      title="Quick-pick OpenRouter model. Auto = Qwen3.5-Flash (cheapest, Alibaba-only). Gemini 2.5 Flash Lite ★ = best balance — multi-provider reliability, 1.5× cost, ~2× faster than Qwen."
                     >
                       <option value="auto">Auto (Qwen-Flash)</option>
-                      <option value="gemini-2.5-flash">Gemini 2.5 Flash ★</option>
-                      <option value="gemini-2.5-flash-lite">Gemini 2.5 Flash Lite</option>
+                      <option value="gemini-2.5-flash-lite">Gemini 2.5 Flash Lite ★</option>
+                      <option value="gemini-2.5-flash">Gemini 2.5 Flash</option>
                       <option value="qwen3-235b">Qwen3-235B Instruct</option>
                       <option value="claude-haiku-4">Claude Haiku 4</option>
                       <option value="custom">Custom…</option>
