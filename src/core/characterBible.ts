@@ -60,19 +60,35 @@ export async function extractCharacterBible(
     onKeyUsed,
   });
 
-  // Tolerant JSON parse — handles Qwen / Gemini quirks: code fences,
-  // commentary, trailing commas, smart quotes, truncated output.
-  // Avoids unnecessary chapter-level retries (each retry = 30s-3min
-  // wasted on the same 3% of corrupt-output cases that a repair pass
-  // would have fixed in microseconds).
-  let parsed: Record<string, unknown>;
+  // Tolerant JSON parse with GRACEFUL fallback. If the model output
+  // is so badly truncated even the repair layer can't recover (e.g.
+  // Qwen3.5-Flash on Alibaba sometimes ignores max_tokens and runs
+  // away with 20K+-token output, then truncates mid-string), we
+  // return a minimal bible instead of throwing. Downstream stages
+  // (comprehend, segment) can still produce a useful chapter from
+  // an empty bible — the narration just won't reference characters
+  // by name. WAY better than triggering a full chapter retry (which
+  // re-runs PDF extract + filter + classify + bible from scratch,
+  // burning 3-5 minutes for what's now a 30-50ms degradation).
+  let parsed: Record<string, unknown> = {};
   try {
     parsed = safeJsonParse<Record<string, unknown>>(raw, "object");
   } catch (e) {
-    throw new Error(
-      `Bible response was not valid JSON: ${(e as Error).message}\n` +
-        `Raw response: ${raw.slice(0, 600)}`,
+    console.warn(
+      `[bible] parse failed — returning empty bible to keep chapter alive. ` +
+        `Error: ${(e as Error).message}. ` +
+        `Raw start: ${raw.slice(0, 300)}`,
     );
+    // Return a graceful fallback instead of throwing. The script
+    // pipeline can still narrate the chapter without character names.
+    return {
+      characters: {},
+      uncertain: [],
+      setting: "",
+      premise: "",
+      tone: "",
+      titlePageIndices: [],
+    };
   }
 
   // Title-page indices come back as 1-based positions in the BATCH we
@@ -103,7 +119,7 @@ function buildPrompt(n: number, prev?: CharacterBible): string {
     ? `
 
 THIS IS AN ONGOING SERIES.
-You MUST return a COMPLETE updated bible (previous characters + any new ones from this chapter), NOT just the new ones. The previous bible above is your starting point — preserve every name and update descriptions if you learn new info. If a previously "uncertain" character is named in this chapter, MOVE them from "uncertain" to "characters" with that name.`
+Return ONLY the characters who APPEAR in THIS chapter's panels (not every character from the previous bible). For each one, use the previous-bible name spelling if available. Add any NEW characters introduced this chapter. Total characters in output: MAX 8 (most important ones for THIS chapter). This keeps the bible focused on the current chapter while preserving cross-chapter name continuity.`
     : "";
 
   return `You are analyzing the opening pages of a manhwa chapter. The ${n} images below are the first kept panels of the story in reading order.${prevContext}${seriesMode}
@@ -125,12 +141,22 @@ Return ONLY valid JSON (no markdown fences, no commentary) with this exact struc
   "title_page_indices": [<1-based positions of credits/title pages in this batch>]
 }
 
+═══════════════════════════════════════════════════════════════════════
+OUTPUT LIMITS — STRICT. EXCEEDING THESE WILL TRUNCATE THE RESPONSE AND BREAK PARSING.
+═══════════════════════════════════════════════════════════════════════
+- Total JSON output: under 1500 words (~ 2500 tokens). Be terse.
+- "characters" entries: MAX 8 names. Pick the most important. Skip background extras.
+- Each character description: MAX 25 words. One short sentence.
+- "uncertain" entries: MAX 4 unnamed characters. One short sentence each.
+- "setting": ONE sentence.
+- "premise": MAX 2 sentences.
+- DO NOT pad descriptions with redundant detail. "Tall man with black hair" is enough.
+
 Hard rules:
 - Only include names you literally SAW written in the panels. Never invent names.
-- If no name is shown, list the character under "uncertain" with a DETAILED description (appearance + role + relationship to named characters).
-- ALWAYS populate "uncertain" — never leave it empty if there are visible characters whose names aren't shown.
+- If no name is shown, list the character under "uncertain" with a SHORT description.
 - If a character's name has multiple spellings across panels, pick the most common one.
-- Be specific in visual descriptions (hair color, distinguishing features, attire) so later scenes can disambiguate.
+- Be specific but concise in visual descriptions (hair color, distinguishing feature, attire).
 
 CRITICAL — Identity continuity (this is where most manhwa narrations fail):
 - Watch for character REVEALS where one character IS another. Common patterns:
