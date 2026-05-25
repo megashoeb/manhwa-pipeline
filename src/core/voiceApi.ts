@@ -146,17 +146,49 @@ export async function createSpeechTask(
   const url = `${baseUrl(config)}/v1/text-to-speech/${encodeURIComponent(
     opts.voiceId,
   )}?output_format=${encodeURIComponent(format)}`;
-  const res = await fetch(url, {
-    method: "POST",
-    headers: {
-      ...authHeaders(config),
-      "Content-Type": "application/json",
-    },
-    body: JSON.stringify({
-      text: opts.text,
-      model_id: opts.modelId ?? "eleven_multilingual_v2",
-    }),
-  });
+
+  // 60-second hard timeout on the create call. Without this, an
+  // unresponsive ai33.pro endpoint can leave a line stuck on
+  // "creating" status indefinitely — the 15-min poll timeout only
+  // applies AFTER a task_id has been returned, so a hung POST never
+  // hits it. AbortController cuts the fetch cleanly and lets the
+  // outer retry loop in processLine make a second attempt.
+  const CREATE_TIMEOUT_MS = 60_000;
+  const ctrl = new AbortController();
+  const timer = window.setTimeout(
+    () =>
+      ctrl.abort(
+        new Error(
+          `TTS task creation timed out after ${CREATE_TIMEOUT_MS / 1000}s`,
+        ),
+      ),
+    CREATE_TIMEOUT_MS,
+  );
+
+  let res: Response;
+  try {
+    res = await fetch(url, {
+      method: "POST",
+      headers: {
+        ...authHeaders(config),
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        text: opts.text,
+        model_id: opts.modelId ?? "eleven_multilingual_v2",
+      }),
+      signal: ctrl.signal,
+    });
+  } catch (e) {
+    if (e instanceof Error && e.name === "AbortError") {
+      throw new Error(
+        `TTS task creation timed out after ${CREATE_TIMEOUT_MS / 1000}s — ai33.pro did not respond. Retrying.`,
+      );
+    }
+    throw e;
+  } finally {
+    window.clearTimeout(timer);
+  }
   if (!res.ok) {
     const detail = await res.text().catch(() => "");
     throw new Error(
