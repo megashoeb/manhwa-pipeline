@@ -967,6 +967,20 @@ export function TtsMode() {
     );
     const t0 = Date.now();
 
+    // Pre-populate audioUrls with the URLs from lines that are
+    // ALREADY done (the ones we're NOT retrying). Workers will fill
+    // in the retried indices. We trust THIS local array — not the
+    // ref — because React's commit cycle hasn't run between the
+    // worker pool finishing and us reading the result, so
+    // ``lineStatesRef.current`` is stale at that point.
+    const audioUrls: (string | null)[] = new Array(lines.length).fill(null);
+    for (let i = 0; i < lineStatesRef.current.length; i++) {
+      const s = lineStatesRef.current[i];
+      if (s?.status === "done" && s.audioUrl && !failedIndices.includes(i)) {
+        audioUrls[i] = s.audioUrl;
+      }
+    }
+
     // Reset state for the lines we're retrying so the UI shows them
     // as in-flight again.
     setLineStates((prev) =>
@@ -976,11 +990,6 @@ export function TtsMode() {
           : s,
       ),
     );
-
-    // Sparse array indexed by line index — workers fill in the URLs
-    // they generate; we read the final URL list off lineStatesRef
-    // (which gets updated inside processLine) after the pool drains.
-    const audioUrls: (string | null)[] = new Array(lines.length).fill(null);
 
     try {
       await runWorkerPool(
@@ -997,19 +1006,18 @@ export function TtsMode() {
 
       const elapsed = ((Date.now() - t0) / 1000).toFixed(1);
 
-      // Check if everything's green now — if yes, auto-stitch.
-      const latest = lineStatesRef.current;
-      const allDone = latest.every((s) => s.status === "done");
-      if (allDone) {
-        const urls = latest.map((s) => s.audioUrl!).filter(Boolean);
-        if (urls.length === latest.length) {
-          appendLog(`✓ Retry finished in ${elapsed}s — all green. Stitching…`);
-          await stitchAndBuild(urls);
-        }
+      // Use the LOCAL audioUrls array (populated synchronously by
+      // workers) instead of lineStatesRef.current, which lags by one
+      // React commit cycle. ``allHaveUrls`` is the authoritative
+      // "did every line end up with an audio URL?" check.
+      const allHaveUrls = audioUrls.every((u) => !!u);
+      if (allHaveUrls) {
+        appendLog(`✓ Retry finished in ${elapsed}s — all green. Stitching…`);
+        await stitchAndBuild(audioUrls as string[]);
       } else {
-        const stillFailed = latest.filter((s) => s.status === "failed").length;
+        const stillMissing = audioUrls.filter((u) => !u).length;
         appendLog(
-          `⚠ Retry finished in ${elapsed}s — ${stillFailed} line(s) still failing. Try once more, or remove them from the script.`,
+          `⚠ Retry finished in ${elapsed}s — ${stillMissing} line(s) still failing. Try once more, or remove them from the script.`,
         );
       }
     } catch (err) {
@@ -1506,6 +1514,45 @@ export function TtsMode() {
                   <RotateCcw className="h-4 w-4" />
                   Retry {lineStates.filter((l) => l.status === "failed").length}{" "}
                   failed
+                </button>
+              )}
+
+            {/* Manual stitch button — appears when EVERY line is done
+                but we haven't actually stitched yet. Useful when the
+                auto-stitch was skipped (e.g. stale-state edge case in
+                the retry flow) or the user clicked cancel right
+                before stitching. Reads the audio URLs directly from
+                lineStates so it never relies on the cache being warm. */}
+            {!busy &&
+              !stitchResult &&
+              lineStates.length > 0 &&
+              lineStates.every((l) => l.status === "done" && l.audioUrl) && (
+                <button
+                  type="button"
+                  onClick={async () => {
+                    const urls = lineStates
+                      .map((l) => l.audioUrl)
+                      .filter((u): u is string => !!u);
+                    if (urls.length !== lineStates.length) return;
+                    setBusy(true);
+                    try {
+                      appendLog(
+                        `Manual stitch — combining ${urls.length} cached audio clips…`,
+                      );
+                      await stitchAndBuild(urls);
+                    } catch (err) {
+                      appendLog(
+                        `Stitch failed: ${err instanceof Error ? err.message : String(err)}`,
+                      );
+                    } finally {
+                      setBusy(false);
+                    }
+                  }}
+                  className="flex items-center gap-2 rounded bg-emerald-600 px-4 py-2 text-sm font-semibold text-white hover:bg-emerald-500"
+                  title="Combine all cached audio clips into the final WAV + SRT without re-generating"
+                >
+                  <Download className="h-4 w-4" />
+                  Stitch &amp; download ({lineStates.length} lines ready)
                 </button>
               )}
 
