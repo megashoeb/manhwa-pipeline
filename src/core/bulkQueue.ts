@@ -1139,86 +1139,116 @@ export async function runBulkQueue(
     orderedEntries.length >= 2 &&
     !abortSignal.aborted
   ) {
-    const { polishScriptGlobally } = await import("./globalScriptPolisher");
-    onProgress({
-      itemIndex: -1,
-      stage: "polishing",
-      current: 0,
-      total: 1,
-      message: `Final polish pass — removing repeated hooks + applying style...`,
-    });
+    // Wrap the entire polish stage in try/catch so a runaway exception
+    // (e.g. dynamic-import failure, slice mismatch on weird input)
+    // can never block the combined-ZIP build below. Worst-case the
+    // user gets the raw script with no polish — they still get their
+    // 18-of-20 chapters zipped + downloadable. Previously a throw
+    // here would tear down everything after, including the ZIP.
+    try {
+      const { polishScriptGlobally } = await import("./globalScriptPolisher");
+      onProgress({
+        itemIndex: -1,
+        stage: "polishing",
+        current: 0,
+        total: 1,
+        message: `Final polish pass — removing repeated hooks + applying style...`,
+      });
 
-    // Flatten ALL chapter lines into one numbered array. Index N in
-    // this array corresponds to entry-flattened-line N. We'll split
-    // the polished result back along the same chapter boundaries.
-    const chapterLineCounts = orderedEntries.map(
-      (e) => e.script.lines.length,
-    );
-    const allLines = orderedEntries.flatMap((e) => e.script.lines);
+      // Flatten ALL chapter lines into one numbered array. Index N in
+      // this array corresponds to entry-flattened-line N. We'll split
+      // the polished result back along the same chapter boundaries.
+      const chapterLineCounts = orderedEntries.map(
+        (e) => e.script.lines.length,
+      );
+      const allLines = orderedEntries.flatMap((e) => e.script.lines);
 
-    const result = await polishScriptGlobally(allLines, {
-      model: opts.globalPolish.model,
-      rotator,
-      bible: masterBible
-        ? {
-            characters: masterBible.characters,
-            uncertain: [],
-            setting: "",
-            premise: "",
-            tone: "",
-            titlePageIndices: [],
-          }
-        : null,
-      styleSeed: opts.globalPolish.styleSeed,
-      pacing: opts.globalPolish.pacing,
-      hookVariety: opts.globalPolish.hookVariety,
-      onKeyUsed,
-    });
+      const result = await polishScriptGlobally(allLines, {
+        model: opts.globalPolish.model,
+        rotator,
+        bible: masterBible
+          ? {
+              characters: masterBible.characters,
+              uncertain: [],
+              setting: "",
+              premise: "",
+              tone: "",
+              titlePageIndices: [],
+            }
+          : null,
+        styleSeed: opts.globalPolish.styleSeed,
+        pacing: opts.globalPolish.pacing,
+        hookVariety: opts.globalPolish.hookVariety,
+        onKeyUsed,
+      });
 
-    opts.onPolishResult?.(result);
+      opts.onPolishResult?.(result);
 
-    if (result.applied) {
-      // Re-split polished lines back into per-chapter buckets and
-      // update each entry's script.lines + scriptText.
-      let cursor = 0;
-      for (let i = 0; i < orderedEntries.length; i++) {
-        const count = chapterLineCounts[i];
-        const slice = result.lines.slice(cursor, cursor + count);
-        cursor += count;
-        orderedEntries[i].script.lines = slice;
-        orderedEntries[i].script.scriptText = slice.join("\n");
-        // Mirror into the first scene's lines so downstream code
-        // (per-scene processing, SRT generation) stays consistent.
-        if (
-          orderedEntries[i].script.scenes &&
-          orderedEntries[i].script.scenes.length > 0
-        ) {
-          // Distribute polished lines into scenes by length. Simplest
-          // approach: stick all polished lines into scene[0] is wrong
-          // because each scene tracks its own line count. Instead,
-          // re-slice per scene the same way as before.
-          let sceneCursor = 0;
-          for (const scene of orderedEntries[i].script.scenes) {
-            const sceneLen = scene.lines.length;
-            scene.lines = slice.slice(sceneCursor, sceneCursor + sceneLen);
-            sceneCursor += sceneLen;
+      if (result.applied) {
+        // Re-split polished lines back into per-chapter buckets and
+        // update each entry's script.lines + scriptText.
+        let cursor = 0;
+        for (let i = 0; i < orderedEntries.length; i++) {
+          const count = chapterLineCounts[i];
+          const slice = result.lines.slice(cursor, cursor + count);
+          cursor += count;
+          orderedEntries[i].script.lines = slice;
+          orderedEntries[i].script.scriptText = slice.join("\n");
+          // Mirror into the first scene's lines so downstream code
+          // (per-scene processing, SRT generation) stays consistent.
+          if (
+            orderedEntries[i].script.scenes &&
+            orderedEntries[i].script.scenes.length > 0
+          ) {
+            let sceneCursor = 0;
+            for (const scene of orderedEntries[i].script.scenes) {
+              const sceneLen = scene.lines.length;
+              scene.lines = slice.slice(sceneCursor, sceneCursor + sceneLen);
+              sceneCursor += sceneLen;
+            }
           }
         }
+        onProgress({
+          itemIndex: -1,
+          stage: "polishing",
+          current: 1,
+          total: 1,
+          message: `Polish applied — style: ${result.resolvedStyle}, pacing: ${result.resolvedPacing}`,
+        });
+      } else {
+        onProgress({
+          itemIndex: -1,
+          stage: "polishing",
+          current: 1,
+          total: 1,
+          message: `Polish skipped (${result.fallbackReason ?? "unknown"}) — raw script used.`,
+        });
       }
-      onProgress({
-        itemIndex: -1,
-        stage: "polishing",
-        current: 1,
-        total: 1,
-        message: `Polish applied — style: ${result.resolvedStyle}, pacing: ${result.resolvedPacing}`,
+    } catch (err) {
+      // Polish blew up unexpectedly. Surface it to the user + the
+      // onPolishResult handler so the UI shows a failure badge, then
+      // continue to the ZIP build with the raw script intact.
+      const reason = err instanceof Error ? err.message : String(err);
+      console.error("[polish] unexpected exception — skipping:", err);
+      opts.onPolishResult?.({
+        applied: false,
+        lines: orderedEntries.flatMap((e) => e.script.lines),
+        fallbackReason: `Polish stage crashed: ${reason}`,
+        resolvedStyle:
+          opts.globalPolish.styleSeed === "auto"
+            ? "punchy-action"
+            : opts.globalPolish.styleSeed,
+        resolvedPacing:
+          opts.globalPolish.pacing === "auto"
+            ? "slow-build"
+            : opts.globalPolish.pacing,
       });
-    } else {
       onProgress({
         itemIndex: -1,
         stage: "polishing",
         current: 1,
         total: 1,
-        message: `Polish skipped (${result.fallbackReason ?? "unknown"}) — raw script used.`,
+        message: `Polish stage failed (${reason}) — continuing with raw script.`,
       });
     }
   }

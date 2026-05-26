@@ -629,11 +629,16 @@ export function BulkMode({ rotator }: Props) {
     pauseRef.current = new PauseController();
     setPaused(false);
 
-    // We pass the (re-)filtered list. Done items are skipped inside
-    // the queue runner because their status will be "done" already.
-    const queueFiles = items
-      .filter((it) => it.status !== "done")
-      .map((it) => it.file);
+    // Pass ALL items (not filtered) so the bulkQueue's ``accumulated``
+    // array has slots for every chapter index. Resume populates the
+    // "done" slots from IDB checkpoints; the worker loop's first
+    // check inside processChapter (``if (accumulated[i]) return;``)
+    // makes those slots cost-free. Without this, a partial-resume
+    // queue would create accumulated[] with a TRUNCATED length, and
+    // checkpoint slots beyond that length would be silently dropped —
+    // the combined ZIP would only contain the chapters processed in
+    // the current session.
+    const queueFiles = items.map((it) => it.file);
     const indexMap = new Map<File, number>();
     items.forEach((it, idx) => indexMap.set(it.file, idx));
 
