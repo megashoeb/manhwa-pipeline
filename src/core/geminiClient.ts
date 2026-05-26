@@ -126,14 +126,15 @@ export async function generateContent(
   if (opts.responseMimeType)
     generationConfig.responseMimeType = opts.responseMimeType;
   // Cap output — Gemini's param is ``maxOutputTokens`` (vs OpenAI's
-  // ``max_tokens``). Same 6144 cap we set on the OpenRouter side so
-  // both providers stop generating around the same length. Without
-  // this, Gemini occasionally runs to its full 8192-token default on
-  // prompts that should produce ~2K tokens — slower + costs more.
-  // 6144 is plenty for whole-chapter narration (~4000 spoken words).
-  // Callers like the global polish stage override via opts.maxOutputTokens
+  // ``max_tokens``). Mirror the OpenRouter side: text-only stages cap
+  // at 6144, vision stages (panel curator, comprehend, bible) bump
+  // to 8192 because reasoning models silently spend some budget on
+  // thinking tokens even when "thinking" is nominally off. Callers
+  // like the global polish stage override via opts.maxOutputTokens
   // because they legitimately need 25K+ tokens of output.
-  generationConfig.maxOutputTokens = opts.maxOutputTokens ?? 6144;
+  const hasImages = (opts.images?.length ?? 0) > 0;
+  generationConfig.maxOutputTokens =
+    opts.maxOutputTokens ?? (hasImages ? 8192 : 6144);
 
   // Disable Google's content safety filters wherever the API lets us.
   // Manhwa narratives routinely depict combat, blood, character death,

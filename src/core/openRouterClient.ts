@@ -321,7 +321,19 @@ export async function callOpenRouter(
   // came back when max_tokens=8192). Setting both fixes the runaway.
   // 6K is enough for whole-chapter narration; structured output
   // stages (curator, segment) need way less.
-  const cap = body.max_tokens ?? opts.maxOutputTokens ?? 6144;
+  // Vision calls need more output headroom than text-only because:
+  //   • Reasoning models (Gemini 2.5 Flash Lite) silently spend some
+  //     output budget on internal thinking tokens even when "thinking"
+  //     is nominally off. The user hit a JSON truncation around 500
+  //     tokens of visible output despite a 6144 cap.
+  //   • Vision JSON outputs (panel curator: 8 objects per call, each
+  //     ~100-150 tokens) can balloon if the model adds long ``reason``
+  //     strings.
+  // Bump the floor to 8192 when images are present so a reasoning
+  // model still has room after burning some budget on thinking.
+  const hasImages = (opts.images?.length ?? 0) > 0;
+  const defaultCap = hasImages ? 8192 : 6144;
+  const cap = body.max_tokens ?? opts.maxOutputTokens ?? defaultCap;
   body.max_tokens = cap;
   body.max_completion_tokens = cap;
 

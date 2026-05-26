@@ -254,14 +254,85 @@ function repairJson(s: string): string {
 
 /**
  * Balance unclosed brackets at the end of the string. Handles the
- * common "completion ran out of tokens mid-JSON" case — Qwen-Flash
- * occasionally truncates near max_tokens.
+ * common "completion ran out of tokens mid-JSON" case — Gemini and
+ * Qwen flash models routinely truncate near max_tokens.
+ *
+ * Two-pass strategy:
+ *   1. Try a "drop the truncated trailing element" repair first.
+ *      For arrays where the last element is a partial object like
+ *      ``{"k`` (key started but no value yet), cut everything after
+ *      the last fully-closed array element and emit ``]``.
+ *   2. If that didn't apply (or we're still unclosed), fall back to
+ *      brute-force closing every dangling bracket / string.
  */
 function balanceBrackets(s: string): string {
-  let openCurly = 0;
-  let openSquare = 0;
+  // ── Pass 1: drop the truncated trailing element ──────────────────
+  // Walk forward, remembering the position right after every fully
+  // closed top-level array element. When we hit end-of-input still
+  // inside a partial element, we'll cut back to the last "safe" cut
+  // point and just emit ``]`` to close the array cleanly.
+  let arrayDepth = 0;
+  let objectDepth = 0;
   let inString = false;
   let escape = false;
+  let lastSafeCutInArray = -1; // index AFTER the last complete element
+  let firstArrayOpen = -1;
+
+  for (let i = 0; i < s.length; i++) {
+    const c = s[i];
+    if (escape) {
+      escape = false;
+      continue;
+    }
+    if (c === "\\") {
+      escape = true;
+      continue;
+    }
+    if (c === '"') {
+      inString = !inString;
+      continue;
+    }
+    if (inString) continue;
+    if (c === "[") {
+      if (arrayDepth === 0 && firstArrayOpen === -1) firstArrayOpen = i;
+      arrayDepth++;
+    } else if (c === "]") {
+      arrayDepth--;
+    } else if (c === "{") {
+      objectDepth++;
+    } else if (c === "}") {
+      objectDepth--;
+      // If we just closed a top-level array element (depth back to
+      // 0 for objects, still inside the outer array), remember this
+      // as a clean cut point.
+      if (objectDepth === 0 && arrayDepth === 1) {
+        lastSafeCutInArray = i + 1;
+      }
+    } else if (c === "," && objectDepth === 0 && arrayDepth === 1) {
+      // Also valid cut: right after a comma at top-of-array level.
+      lastSafeCutInArray = i + 1;
+    }
+  }
+
+  // If we ended inside a partial element of an array, drop it.
+  const truncatedInsideArrayElement =
+    arrayDepth >= 1 && (objectDepth > 0 || inString);
+  if (
+    truncatedInsideArrayElement &&
+    lastSafeCutInArray > firstArrayOpen &&
+    lastSafeCutInArray < s.length
+  ) {
+    // Slice to the safe cut, strip any trailing comma, append ``]``.
+    let cut = s.slice(0, lastSafeCutInArray).replace(/,\s*$/, "");
+    cut += "]";
+    return cut;
+  }
+
+  // ── Pass 2: brute-force bracket closing (legacy behavior) ────────
+  let openCurly = 0;
+  let openSquare = 0;
+  inString = false;
+  escape = false;
   for (let i = 0; i < s.length; i++) {
     const c = s[i];
     if (escape) {
@@ -282,13 +353,9 @@ function balanceBrackets(s: string): string {
     else if (c === "[") openSquare++;
     else if (c === "]") openSquare--;
   }
-  // Close in reverse order — last-opened goes first.
   let suffix = "";
-  // If we're stuck inside a string when the input ends, close it.
   if (inString) suffix += '"';
-  // Heuristic: if last meaningful char is a comma, drop it (trailing).
   let trimmed = s.replace(/,\s*$/, "");
-  // Close any unclosed brackets.
   while (openSquare > 0) {
     suffix += "]";
     openSquare--;
