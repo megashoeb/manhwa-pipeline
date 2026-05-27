@@ -53,6 +53,26 @@ export interface GenerateOptions {
    * needs ~25K output tokens to round-trip correctly, for example.
    */
   maxOutputTokens?: number;
+  /**
+   * Override the default 180s per-attempt fetch timeout. Forwarded to
+   * the OpenRouter dispatcher when the key is OpenRouter. Required
+   * for very long generations (e.g. Claude Sonnet 4.6 emitting 30K
+   * output tokens at ~44 tps = ~11 min) where the default would abort
+   * mid-stream.
+   */
+  timeoutMs?: number;
+  /**
+   * Request a streamed response. Currently honoured only by the
+   * OpenRouter path — Gemini direct still uses blocking fetch.
+   * When true, the response is delivered incrementally and the
+   * caller can react to each chunk via ``onContent``.
+   */
+  stream?: boolean;
+  /**
+   * Per-chunk callback fired for every streamed delta. Useful for
+   * showing live progress in the UI during a long polish call.
+   */
+  onContent?: (delta: string, accumulated: string) => void;
 }
 
 export class GeminiError extends Error {
@@ -247,6 +267,9 @@ async function callWithRetries(
           topP: opts.topP,
           onKeyUsed: opts.onKeyUsed,
           maxOutputTokens: opts.maxOutputTokens,
+          timeoutMs: opts.timeoutMs,
+          stream: opts.stream,
+          onContent: opts.onContent,
         });
       } catch (e) {
         // OpenRouter failure — translate to GeminiError shape so the
@@ -288,10 +311,11 @@ async function callWithRetries(
     // AbortController + setTimeout guarantees a stuck fetch can't hang
     // the worker forever. If the timeout fires we treat it as a network
     // error and fall through to the existing retry logic.
+    const effectiveTimeoutMs = opts.timeoutMs ?? REQUEST_TIMEOUT_MS;
     const ctrl = new AbortController();
     const timeoutHandle = window.setTimeout(
-      () => ctrl.abort(new Error(`Gemini request timed out after ${REQUEST_TIMEOUT_MS}ms`)),
-      REQUEST_TIMEOUT_MS,
+      () => ctrl.abort(new Error(`Gemini request timed out after ${effectiveTimeoutMs}ms`)),
+      effectiveTimeoutMs,
     );
     try {
       response = await fetch(

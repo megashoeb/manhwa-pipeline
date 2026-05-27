@@ -278,6 +278,40 @@ export interface OpenRouterCallOptions {
    * round-trip correctly.
    */
   maxOutputTokens?: number;
+  /**
+   * Override the default 120s per-attempt fetch timeout.
+   *
+   * Some models (Claude Sonnet 4.6 generating 30K output tokens at
+   * ~44 tps takes ~11 minutes) genuinely need a longer budget than
+   * the default tuned for short Qwen/Gemini calls. Pass an explicit
+   * number of milliseconds — the caller knows its workload best.
+   *
+   * Default = ``REQUEST_TIMEOUT_MS`` (120 000 ms).
+   */
+  timeoutMs?: number;
+  /**
+   * Enable Server-Sent Events streaming so the caller can react to
+   * each token as it arrives. Required for any UI that wants live
+   * progress on a long generation (e.g. the Polish tab during a
+   * 15-minute Sonnet polish). When false / omitted, behaves like a
+   * normal blocking call.
+   *
+   * Must be paired with ``onContent`` (or the stream is silently
+   * accumulated and only returned at the end — which is functionally
+   * identical to non-streaming).
+   */
+  stream?: boolean;
+  /**
+   * Per-delta callback fired for every content chunk received over
+   * the SSE stream. Only useful when ``stream: true``.
+   *
+   *   delta = the new text fragment in THIS chunk (NOT the full text)
+   *   accumulated = everything received so far
+   *
+   * UI tip: count newlines in ``accumulated`` to estimate how many
+   * lines of a numbered-list response have completed.
+   */
+  onContent?: (delta: string, accumulated: string) => void;
 }
 
 function maskKey(k: string): string {
@@ -337,6 +371,13 @@ export async function callOpenRouter(
   body.max_tokens = cap;
   body.max_completion_tokens = cap;
 
+  // Streaming mode — request SSE so the caller can react to each
+  // token as it arrives. The body field is a standard OpenAI-compatible
+  // ``stream`` flag.
+  if (opts.stream) {
+    (body as unknown as { stream: boolean }).stream = true;
+  }
+
   opts.onKeyUsed?.(maskKey(apiKey));
 
   let lastErr: unknown = null;
@@ -352,13 +393,14 @@ export async function callOpenRouter(
         key: maskKey(apiKey),
       },
     });
+    const effectiveTimeoutMs = opts.timeoutMs ?? REQUEST_TIMEOUT_MS;
     const ctrl = new AbortController();
     const timeoutHandle = window.setTimeout(
       () =>
         ctrl.abort(
-          new Error(`OpenRouter request timed out after ${REQUEST_TIMEOUT_MS}ms`),
+          new Error(`OpenRouter request timed out after ${effectiveTimeoutMs}ms`),
         ),
-      REQUEST_TIMEOUT_MS,
+      effectiveTimeoutMs,
     );
 
     let response: Response;
@@ -472,7 +514,29 @@ export async function callOpenRouter(
       );
     }
 
-    // Success path.
+    // Success path — streaming branch.
+    if (opts.stream) {
+      const streamed = await readSseStream(response, opts.onContent);
+      rotator.recordSuccess(apiKey);
+      if (!streamed.trim()) {
+        throw new OpenRouterError(
+          "OpenRouter streaming returned an empty response",
+          0,
+        );
+      }
+      debugLog.push({
+        type: "api-success",
+        label: `openrouter ${opts.model} (streamed)`,
+        durationMs: Date.now() - callStartedAt,
+        context: {
+          attempt: attempt + 1,
+          outputChars: streamed.length,
+        },
+      });
+      return streamed;
+    }
+
+    // Success path — non-streaming branch (default).
     const data = (await response.json()) as OpenRouterResponse;
     rotator.recordSuccess(apiKey);
 
@@ -521,4 +585,104 @@ export async function callOpenRouter(
 
   if (lastErr instanceof Error) throw lastErr;
   throw new OpenRouterError("Exhausted retries calling OpenRouter", 0);
+}
+
+
+// ─────────────────────────────────────────────────────────────────────
+// SSE streaming helper
+// ─────────────────────────────────────────────────────────────────────
+
+/**
+ * Read an OpenAI-compatible Server-Sent Events stream from a fetch
+ * Response and return the accumulated content. Fires ``onContent``
+ * for every delta so the UI can show live progress.
+ *
+ * SSE wire format (OpenAI / OpenRouter):
+ *
+ *   data: {"id":"...","choices":[{"delta":{"content":"He"}}]}\n\n
+ *   data: {"id":"...","choices":[{"delta":{"content":"llo"}}]}\n\n
+ *   data: [DONE]\n\n
+ *
+ * Each event = one or more ``key: value`` lines terminated by a
+ * double newline. We only care about ``data:`` lines.
+ */
+async function readSseStream(
+  response: Response,
+  onContent?: (delta: string, accumulated: string) => void,
+): Promise<string> {
+  const body = response.body;
+  if (!body) {
+    throw new OpenRouterError("Streaming response has no body", 0);
+  }
+  const reader = body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = "";
+  let accumulated = "";
+
+  try {
+    while (true) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      buffer += decoder.decode(value, { stream: true });
+
+      // Drain complete SSE events (separated by blank lines).
+      let eventEnd: number;
+      while ((eventEnd = findEventEnd(buffer)) >= 0) {
+        const event = buffer.slice(0, eventEnd);
+        // Skip past the terminator (could be \n\n or \r\n\r\n).
+        const sepLen = buffer.startsWith("\r\n\r\n", eventEnd)
+          ? 4
+          : buffer[eventEnd] === "\r" && buffer[eventEnd + 1] === "\n"
+            ? 2
+            : 2;
+        buffer = buffer.slice(eventEnd + sepLen);
+
+        // Parse each ``data: ...`` line in this event.
+        for (const rawLine of event.split(/\r?\n/)) {
+          if (!rawLine.startsWith("data:")) continue;
+          const data = rawLine.slice(5).trimStart();
+          if (!data) continue;
+          if (data === "[DONE]") return accumulated;
+          try {
+            const parsed = JSON.parse(data) as {
+              choices?: Array<{ delta?: { content?: string } }>;
+              error?: { message?: string };
+            };
+            if (parsed.error) {
+              throw new OpenRouterError(
+                `OpenRouter stream error: ${parsed.error.message ?? "unknown"}`,
+                0,
+              );
+            }
+            const delta = parsed.choices?.[0]?.delta?.content;
+            if (typeof delta === "string" && delta.length > 0) {
+              accumulated += delta;
+              onContent?.(delta, accumulated);
+            }
+          } catch (parseErr) {
+            // Some providers emit non-JSON "keepalive" lines (e.g.
+            // ": OPENROUTER PROCESSING") — those are fine to ignore.
+            // Re-throw only when our own error type is rethrown.
+            if (parseErr instanceof OpenRouterError) throw parseErr;
+          }
+        }
+      }
+    }
+  } finally {
+    try {
+      reader.releaseLock();
+    } catch {
+      /* ignore */
+    }
+  }
+  return accumulated;
+}
+
+/** Find the byte offset of the first event terminator (\n\n or \r\n\r\n). */
+function findEventEnd(buf: string): number {
+  const a = buf.indexOf("\n\n");
+  const b = buf.indexOf("\r\n\r\n");
+  if (a < 0) return b;
+  if (b < 0) return a;
+  return Math.min(a, b);
 }

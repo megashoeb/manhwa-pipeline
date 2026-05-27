@@ -19,8 +19,10 @@ const MODEL_PRESETS: Record<string, string> = {
   auto: "",
   "gemini-2.5-flash": "google/gemini-2.5-flash",
   "gemini-2.5-flash-lite": "google/gemini-2.5-flash-lite",
+  "gemini-2.5-pro": "google/gemini-2.5-pro",
   "qwen3-235b": "qwen/qwen3-235b-a22b-instruct-2507",
   "claude-haiku-4": "anthropic/claude-haiku-4",
+  "claude-sonnet-4.6": "anthropic/claude-sonnet-4.6",
 };
 
 /** Reverse lookup — figure out which preset matches an existing

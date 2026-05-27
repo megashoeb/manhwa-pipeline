@@ -75,7 +75,7 @@ export function safeJsonParse<T = unknown>(
     });
     return r;
   } catch (err) {
-    // Final attempt: balance brackets in case the model was truncated.
+    // Final attempt 1: balance brackets in case the model was truncated.
     const balanced = balanceBrackets(repaired);
     try {
       const r = JSON.parse(balanced) as T;
@@ -86,6 +86,24 @@ export function safeJsonParse<T = unknown>(
       });
       return r;
     } catch {
+      // Final attempt 2: numbered-list fallback. When a model ignores
+      // the "output a JSON array" instruction and returns
+      //   1. first line
+      //   2. second line
+      // we extract those lines and synthesize the array. Only kicks in
+      // when expecting an array (chapter scripts / bridges / polish).
+      if (expectedType === "array") {
+        const listLines = extractNumberedList(cleaned);
+        if (listLines.length >= 3) {
+          debugLog.push({
+            type: "parse-repair",
+            label: `JSON parse (numbered-list fallback — model returned "1. text" instead of JSON, recovered ${listLines.length} lines)`,
+            detail: raw.slice(0, 200),
+          });
+          return listLines as unknown as T;
+        }
+      }
+
       debugLog.push({
         type: "parse-fail",
         label: "JSON parse failed after all repair attempts",
@@ -97,6 +115,43 @@ export function safeJsonParse<T = unknown>(
       );
     }
   }
+}
+
+/**
+ * Recover lines from a numbered-list output like:
+ *
+ *   1. First line of narration.
+ *   2. Second line of narration.
+ *   3. ...
+ *
+ * Some Gemini models (especially preview variants under load) ignore
+ * the "JSON array" instruction and return prose lists instead. Rather
+ * than failing the whole chapter retry, we salvage the lines.
+ *
+ * Rules:
+ *   - Match ``^\s*\d+[.)]\s+`` at the start of each line
+ *   - Trim, strip surrounding quotes / trailing commas the model added
+ *   - Skip blank lines and continuation text (lines not starting with a number)
+ *   - Abort if we encounter what looks like JSON syntax (``[`` / ``{``) —
+ *     that means we mis-identified the format
+ */
+function extractNumberedList(text: string): string[] {
+  const lines: string[] = [];
+  const re = /^\s*(\d+)[.)]\s+(.+?)\s*$/;
+  for (const rawLine of text.split(/\r?\n/)) {
+    const trimmed = rawLine.trim();
+    if (!trimmed) continue;
+    if (trimmed.startsWith("{") || trimmed.startsWith("[")) {
+      // Looks like JSON after all — abort the numbered-list path.
+      return [];
+    }
+    const m = re.exec(rawLine);
+    if (m) {
+      const content = m[2].replace(/^["'`]|["'`,]+$/g, "").trim();
+      if (content.length > 0) lines.push(content);
+    }
+  }
+  return lines;
 }
 
 /**

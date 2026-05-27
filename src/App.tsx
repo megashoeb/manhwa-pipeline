@@ -7,6 +7,7 @@ import {
   FileText,
   Files,
   Mic,
+  Wand2,
 } from "lucide-react";
 import clsx from "clsx";
 
@@ -17,6 +18,7 @@ import { FilterSettingsPanel } from "./components/FilterSettings";
 import { ApiKeyManager } from "./components/ApiKeyManager";
 import { ScriptOutput } from "./components/ScriptOutput";
 import { BulkMode } from "./components/BulkMode";
+import { PolishMode } from "./components/PolishMode";
 import { TtsMode } from "./components/TtsMode";
 import { DebugPanel } from "./components/DebugPanel";
 
@@ -51,7 +53,7 @@ interface Progress {
 
 const GEMINI_MODEL = "gemini-3.1-flash-lite";
 
-type AppMode = "single" | "bulk" | "tts";
+type AppMode = "single" | "bulk" | "polish" | "tts";
 
 function App() {
   // One KeyRotator instance for the lifetime of the app, persisted to localStorage.
@@ -252,6 +254,8 @@ function App() {
 
         {mode === "bulk" ? (
           <BulkMode rotator={rotator} />
+        ) : mode === "polish" ? (
+          <PolishMode rotator={rotator} />
         ) : mode === "tts" ? (
           <TtsMode />
         ) : (
@@ -478,6 +482,14 @@ function ModeToggle({
         icon={<Files className="h-3.5 w-3.5" />}
         label="Bulk queue"
         hint="Drop many PDFs, auto-download each chapter, master bible"
+        disabled={disabled}
+      />
+      <ModeButton
+        active={mode === "polish"}
+        onClick={() => !disabled && onChange("polish")}
+        icon={<Wand2 className="h-3.5 w-3.5" />}
+        label="Polish"
+        hint="Paste a script, choose a model, get a polished rewrite (Gemini / Claude Sonnet 4.6)"
         disabled={disabled}
       />
       <ModeButton

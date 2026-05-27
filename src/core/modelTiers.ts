@@ -63,25 +63,27 @@ export const MODEL_TIERS = {
   filler: "gemini-3.1-flash-lite",
   /**
    * Stage 3 — whole-chapter vision comprehension (3A) + beat
-   * segmentation (3B). Gemini 3 generation noticeably better at
-   * "fill the connective context, motivation, stakes" work this
-   * stage needs. Preview model so price-aware users may want to
-   * downgrade to gemini-2.5-flash (free GA) — flip the constant.
+   * segmentation (3B). Switched 2026-05-26 from gemini-3-flash-preview
+   * → gemini-2.5-flash because the preview model was hitting heavy
+   * 429/503 on the user's free-tier quota and producing truncated /
+   * non-JSON output (numbered lists instead of arrays). 2.5-flash is
+   * GA, has 1000 RPM on free tier, and follows JSON instructions
+   * reliably. Quality loss is minor (gen-2.5 vs gen-3 narration).
+   * Flip back to gemini-3-flash-preview when paid quota is funded.
    */
-  script: "gemini-3-flash-preview",
+  script: "gemini-2.5-flash",
   /** Stage 4 — continuity bridges (text-only). Shared with script. */
-  continuity: "gemini-3-flash-preview",
+  continuity: "gemini-2.5-flash",
   /**
-   * Stage 5 — polish + hook addition. Quality matters most here. We
-   * use gemini-3-flash-preview by default since the premium
-   * gemini-3.1-pro-preview is currently 429-throttled. When the
-   * user's pro quota resets they can flip this to
-   * gemini-3.1-pro-preview for a small quality bump on the hook +
-   * dialogue weaving.
+   * Stage 5 — polish + hook addition. Switched to gemini-2.5-flash
+   * for the same reason as script (free-tier preview throttling).
+   * For premium polish quality, the new Stage 6 global polish uses
+   * gemini-2.5-flash-lite explicitly via globalScriptPolisher.ts —
+   * that bypasses this tier setting.
    */
-  polish: "gemini-3-flash-preview",
+  polish: "gemini-2.5-flash",
   /** Stage 5b — structural editor (skipped in long-form mode anyway). */
-  structural: "gemini-3-flash-preview",
+  structural: "gemini-2.5-flash",
 } as const;
 
 export const MODEL_BACKUPS = {
@@ -132,18 +134,31 @@ export const MODEL_RPM_LIMITS: Record<string, number> = {
  * specific Qwen / DeepSeek / Claude model instead.
  */
 export const OPENROUTER_MODEL_MAP: Record<string, string> = {
-  // All current Gemini models → Qwen3.5-Flash (cheap + vision + fast).
+  // Legacy / pipeline-internal Gemini IDs → Qwen3.5-Flash (cheap + vision
+  // + fast). Used by the old PDF Bulk pipeline whose calls aren't
+  // quality-sensitive (filter scoring, simple comprehend batches).
   "gemini-3.1-flash-lite": "qwen/qwen3.5-flash-02-23",
-  "gemini-2.5-flash": "qwen/qwen3.5-flash-02-23",
   "gemini-2.0-flash": "qwen/qwen3.5-flash-02-23",
   "gemini-2.0-flash-lite": "qwen/qwen3.5-flash-02-23",
   "gemini-3-flash-preview": "qwen/qwen3.5-flash-02-23",
   "gemini-3.1-pro-preview": "qwen/qwen3.6-plus", // step up for premium tier
-  "gemini-2.5-pro": "qwen/qwen3.6-plus",
-  // Global polish stage explicitly asks for Gemini 2.5 Flash Lite —
-  // when the picked key is OpenRouter, route to the real Gemini-on-
-  // OpenRouter route so the user gets polish quality, not Qwen.
+
+  // Quality-sensitive folder-mode + global-polish stages: route to the
+  // REAL Gemini on OpenRouter so the user gets the model they paid for,
+  // not a Qwen substitute. Folder mode in particular needs strong
+  // constraint following (panel_index range, crop coords, target line
+  // count) that Qwen reliably struggles with.
   "gemini-2.5-flash-lite": "google/gemini-2.5-flash-lite",
+  "gemini-2.5-flash": "google/gemini-2.5-flash",
+  "gemini-2.5-pro": "google/gemini-2.5-pro",
+
+  // Premium polish tier — Anthropic Claude Sonnet 4.6 via OpenRouter.
+  // Used by the standalone Polish tab when the user opts in for the
+  // highest-quality script polish (anti-pattern rule adherence, prose
+  // smoothness, adjective variety). ~$0.33 per 1000-line polish, ~30×
+  // cheaper than Opus while delivering noticeably better polish than
+  // Gemini Flash.
+  "claude-sonnet-4.6": "anthropic/claude-sonnet-4.6",
 };
 
 /** Default OpenRouter model when no mapping exists for the requested Gemini model. */

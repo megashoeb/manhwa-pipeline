@@ -1,3 +1,5 @@
+import { debugLog } from "./debugLog";
+
 // Webtoon panel slicer.
 //
 // Manhwa chapters often arrive as PDFs where each page is a single
@@ -624,13 +626,25 @@ function hasInsufficientContent(
  * boundaries, but in a video each chunk gets its own animation so
  * the slight overlap reads as motion rather than misalignment.
  */
-const MAX_OUTPUT_ASPECT = 2.0; // H / W
+// Increased 2026-05-27 from 2.0 → 4.0 after diagnostic logging confirmed
+// that the lower threshold was force-splitting SINGLE tall panels
+// (splash pages, full-body character shots — aspect 2-4) into multiple
+// visually-identical chunks. This produced the user-visible
+// "1,2,3 same → 4 different → 5,6,7 same" duplicate panels in the ZIP.
+//
+// New rule: only force-split when aspect > 4 (i.e., the slice is
+// almost certainly a stack of 4+ packed panels with no detected
+// gutters). Single tall panels with aspect 2-4 pass through unchanged,
+// preserving the artist's intent.
+const MAX_OUTPUT_ASPECT = 4.0; // H / W
 
 function forceSplitTallSlices(
   slices: SliceRect[],
   minChunkHeight: number,
 ): SliceRect[] {
   const out: SliceRect[] = [];
+  let splitCount = 0;
+  let chunksProduced = 0;
   for (const s of slices) {
     const aspect = s.height / s.width;
     if (aspect <= MAX_OUTPUT_ASPECT) {
@@ -641,6 +655,21 @@ function forceSplitTallSlices(
     const targetChunkH = Math.max(minChunkHeight, Math.floor(s.width * 1.5));
     const nChunks = Math.min(8, Math.max(2, Math.round(s.height / targetChunkH)));
     const chunkH = Math.floor(s.height / nChunks);
+
+    // Lightweight log so we can confirm the threshold change worked.
+    // Post-fix these should be rare (only true multi-panel strips with
+    // aspect > 4 trigger this code path).
+    debugLog.push({
+      type: "info",
+      label: `panelSlicer: force-split tall multi-panel strip → ${nChunks} chunks`,
+      detail:
+        `Input: ${s.width}×${s.height}px (aspect ${aspect.toFixed(2)}). ` +
+        `Treated as a stack of ~${nChunks} packed panels with no detected gutters.`,
+    });
+
+    splitCount++;
+    chunksProduced += nChunks;
+
     for (let i = 0; i < nChunks; i++) {
       const isLast = i === nChunks - 1;
       out.push({
@@ -653,6 +682,15 @@ function forceSplitTallSlices(
       });
     }
   }
+
+  // Page-level summary: only emit if something actually got split.
+  if (splitCount > 0) {
+    debugLog.push({
+      type: "info",
+      label: `panelSlicer: ${splitCount} multi-panel strip(s) force-split → ${chunksProduced} chunks (${out.length - chunksProduced} other slices unchanged)`,
+    });
+  }
+
   return out;
 }
 
