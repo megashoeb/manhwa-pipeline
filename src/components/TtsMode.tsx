@@ -44,6 +44,7 @@ import {
 } from "../core/voiceApi";
 import {
   fetchDecodeStitch,
+  fetchDecodeStitchStreamed,
   type StitchResult,
 } from "../core/voiceAudioStitcher";
 import { buildSrt } from "../core/voiceSrtBuilder";
@@ -715,10 +716,20 @@ export function TtsMode() {
    */
   const stitchAndBuild = useCallback(
     async (audioUrls: string[]) => {
+      // Pick stitcher: for big batches (≥ 200 lines) use the streaming
+      // path that never holds the full mixed signal in contiguous heap.
+      // The legacy ``fetchDecodeStitch`` path peaks at ~3.2 GB on a
+      // 1441-line script — crashes with "Array buffer allocation
+      // failed" on macOS where the per-allocation ceiling is ~2 GB.
+      const useStreaming = audioUrls.length >= 200;
       appendLog(
-        `Stitching ${audioUrls.length} clips with ${lastForm.silenceMs}ms silence…`,
+        `Stitching ${audioUrls.length} clips with ${lastForm.silenceMs}ms silence` +
+          (useStreaming ? " (memory-safe streaming mode)…" : "…"),
       );
-      const stitch: StitchResult = await fetchDecodeStitch({
+      const stitcher = useStreaming
+        ? fetchDecodeStitchStreamed
+        : fetchDecodeStitch;
+      const stitch: StitchResult = await stitcher({
         urls: audioUrls,
         silenceMs: lastForm.silenceMs,
         onLineDecoded: (current, total, durationMs) => {
